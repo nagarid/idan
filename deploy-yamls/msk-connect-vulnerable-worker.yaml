@@ -1,0 +1,200 @@
+# ============================================================
+# MSK Connect CloudFormation — Vulnerable Configuration
+# ============================================================
+# This template creates an MSK Connect connector with the default
+# connector.client.config.override.policy=All, which enables:
+#   FINDING-003: Plugin classloading from attacker-controlled paths
+#   FINDING-004: Connector configs can override SASL JAAS settings
+#   FINDING-010: Leader election based on unverified group assignment
+#
+# The IAM execution role has broad permissions, amplifying FINDING-004
+# (any attacker reaching port 8083 gains IAM role capabilities).
+#
+# DO NOT DEPLOY IN PRODUCTION — for security research only.
+# ============================================================
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  MSK Connect vulnerable worker configuration — illustrates attack surface
+  for FINDING-003, FINDING-004, FINDING-010.
+
+Parameters:
+  MSKClusterArn:
+    Type: String
+    Description: ARN of the Amazon MSK cluster to connect to
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the MSK Connect worker (should be private — but vuln if shared with app tier)
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group allowing inbound on port 8083 from the application tier
+
+  PluginArn:
+    Type: String
+    Description: ARN of the MSK Connect custom plugin
+
+  MSKBootstrapServers:
+    Type: String
+    Description: MSK bootstrap server endpoints
+
+Resources:
+
+  # ---- IAM Execution Role (over-permissioned — amplifies FINDING-004) ----
+  ConnectorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: msk-connect-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kafkaconnect.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MSKConnectOverpermissioned
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # VULNERABLE: kafka-cluster:* allows any Kafka operation
+              # An attacker who creates connectors via the unauth REST API
+              # (FINDING-004) inherits ALL of these permissions.
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:*                       # VULNERABLE: wildcard
+                  - kafka-cluster:Connect
+                  - kafka-cluster:AlterCluster
+                  - kafka-cluster:DescribeCluster
+                Resource: !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:cluster/*"
+              - Effect: Allow
+                Action:
+                  - kafka-cluster:*Topic*
+                  - kafka-cluster:ReadData
+                  - kafka-cluster:WriteData
+                Resource: !Sub "arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/*"
+              # S3 access — connector can read/write any bucket in the account
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource: "*"                              # VULNERABLE: no bucket restriction
+              # Secrets Manager — connector can read any secret
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: "*"                              # VULNERABLE: no secret restriction
+
+  # ---- MSK Connect Connector (vulnerable configuration) ----
+  VulnerableConnector:
+    Type: AWS::MSKConnect::Connector
+    Properties:
+      ConnectorName: vulnerable-pipeline-connector
+
+      # VULNERABLE: Uses the over-permissioned execution role above
+      ServiceExecutionRoleArn: !GetAtt ConnectorExecutionRole.Arn
+
+      KafkaCluster:
+        ApacheKafkaCluster:
+          BootstrapServers: !Ref MSKBootstrapServers
+          Vpc:
+            Subnets: !Ref SubnetIds
+            SecurityGroups:
+              - !Ref SecurityGroupId
+
+      KafkaClusterClientAuthentication:
+        AuthenticationType: IAM
+
+      KafkaClusterEncryptionInTransit:
+        EncryptionType: TLS
+
+      # ---- VULNERABLE CONNECTOR CONFIGURATION ----
+      ConnectorConfiguration:
+        connector.class: "io.confluent.connect.s3.S3SinkConnector"
+        tasks.max: "2"
+        topics: "sensitive-data,customer-pii,payment-events"
+
+        # FINDING-003 / FINDING-004:
+        # connector.client.config.override.policy defaults to "All"
+        # This allows connector-level configs to override worker SASL settings,
+        # enabling JAAS injection attacks (CVE-2023-25194 / CVE-2025-27818 class).
+        # The line below is intentionally ABSENT (the dangerous default is in effect):
+        # connector.client.config.override.policy: None    # <-- THIS IS MISSING
+
+        # FINDING-009 (amplified):
+        # No rate limiting on credential resolution — attacker can flood auth attempts
+        # using the over-permissioned role to amplify IMDS exhaustion.
+
+        s3.region: !Ref "AWS::Region"
+        s3.bucket.name: "data-lake-bucket"
+        s3.part.size: "67108864"
+        flush.size: "1000"
+
+        key.converter: "org.apache.kafka.connect.storage.StringConverter"
+        value.converter: "org.apache.kafka.connect.json.JsonConverter"
+        value.converter.schemas.enable: "false"
+
+        # FINDING-001 amplified: if attacker captures IAM token from this role,
+        # they can replay it against MSK since broker doesn't check expiry.
+        # The role has kafka-cluster:* so the replayed token grants full access.
+
+      Capacity:
+        AutoScaling:
+          MaxWorkerCount: 2
+          MinWorkerCount: 1
+          ScaleInPolicy:
+            CpuUtilizationPercentage: 20
+          ScaleOutPolicy:
+            CpuUtilizationPercentage: 80
+          McuCount: 1
+
+      Plugins:
+        - CustomPlugin:
+            CustomPluginArn: !Ref PluginArn
+            Revision: 1
+
+      # FINDING-010: No custom group ID isolation
+      # Workers share the default Connect group, making leader election
+      # susceptible to assignment injection via __connect-configs topic writes.
+      WorkerConfiguration:
+        WorkerConfigurationArn: !Ref VulnerableWorkerConfig
+        Revision: 1
+
+  # ---- Worker Configuration (missing critical hardening) ----
+  VulnerableWorkerConfig:
+    Type: AWS::MSKConnect::WorkerConfiguration
+    Properties:
+      Name: vulnerable-worker-config
+      Description: "Missing connector.client.config.override.policy=None and other hardening"
+      PropertiesFileContent: |
+        # VULNERABLE: connector.client.config.override.policy not set → defaults to All
+        # connector.client.config.override.policy=None   # <-- ADD THIS TO FIX FINDING-003/004
+
+        # VULNERABLE: config.providers includes FileConfigProvider and EnvVarConfigProvider
+        # These allow connectors to read arbitrary files and env vars (FINDING-004 amplified)
+        config.providers=file,env
+        config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider
+        config.providers.env.class=org.apache.kafka.common.config.provider.EnvVarConfigProvider
+
+        # VULNERABLE: REST API not restricted (no listeners binding, no auth)
+        # Any resource in the VPC can reach port 8083 without credentials
+        # listeners=HTTP://:8083   # defaults to 0.0.0.0 — remove or bind to localhost
+
+        key.converter=org.apache.kafka.connect.storage.StringConverter
+        value.converter=org.apache.kafka.connect.json.JsonConverter
+
+        # VULNERABLE: No request signing requirement
+        # inter-worker request signing disabled by default (allows FINDING-010)
+        # inter.worker.verification.algorithms=HmacSHA256   # <-- ADD THIS TO FIX FINDING-010
+
+Outputs:
+  ConnectorArn:
+    Value: !Ref VulnerableConnector
+    Description: ARN of the MSK Connect connector (vulnerable configuration)
+  ExecutionRoleArn:
+    Value: !GetAtt ConnectorExecutionRole.Arn
+    Description: Over-permissioned IAM role — attack surface for FINDING-004

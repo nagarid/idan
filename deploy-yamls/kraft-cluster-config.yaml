@@ -1,0 +1,217 @@
+# ============================================================
+# KRaft Cluster Docker Compose — Research Lab Setup
+# ============================================================
+# A three-node KRaft (ZooKeeper-free) Kafka cluster for testing
+# FINDING-002 (High Watermark TOCTOU) and FINDING-005 (Epoch Asymmetry).
+#
+# The configuration deliberately uses a small quorum (3 nodes) and
+# short election timeouts to make epoch boundary conditions and
+# leadership churn easier to trigger in a lab environment.
+#
+# DO NOT USE IN PRODUCTION.
+# ============================================================
+
+version: "3.8"
+
+services:
+
+  # ---- Controller/Broker Node 1 (initial active controller) ----
+  kafka-1:
+    image: apache/kafka:3.9.0
+    hostname: kafka-1
+    container_name: kafka-finding-1
+    environment:
+      # KRaft mode — no ZooKeeper
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+      # ---- Short timeouts — expose FINDING-002 and FINDING-005 ----
+      # Short election timeout means leadership churn happens faster,
+      # making it easier to trigger the TOCTOU window in onUpdateLeaderHighWatermark.
+      KAFKA_RAFT_ELECTION_TIMEOUT_MS: 500       # default: 1000ms
+      KAFKA_RAFT_FETCH_TIMEOUT_MS: 200          # default: 500ms
+      KAFKA_RAFT_RETRY_BACKOFF_MS: 50           # default: 100ms
+
+      # ---- No inter-broker authentication (simplifies lab setup) ----
+      KAFKA_SECURITY_INTER_BROKER_PROTOCOL: PLAINTEXT
+
+      # ---- Log replication settings ----
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2              # requires 2/3 ISR — relevant to FINDING-002
+      KAFKA_NUM_PARTITIONS: 3
+
+      # ---- FINDING-007: Disable broker-side request size limit for overflow testing ----
+      KAFKA_MESSAGE_MAX_BYTES: 10000000000      # 10 GB — allows overflow PoC
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10000000000
+
+      # ---- FINDING-008: Minimal thread pool — easier to exhaust ----
+      KAFKA_NUM_NETWORK_THREADS: 3
+      KAFKA_NUM_IO_THREADS: 4                   # default 8 — halved to ease exhaustion test
+
+      # ---- ACL settings for FINDING-006 ----
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      KAFKA_SUPER_USERS: "User:admin"
+
+    volumes:
+      - kafka-1-data:/var/lib/kafka/data
+    ports:
+      - "19092:9092"   # External access for kafka-python PoC scripts
+      - "19093:9093"   # Controller port (for FINDING-005 vote message injection)
+
+  # ---- Controller/Broker Node 2 ----
+  kafka-2:
+    image: apache/kafka:3.9.0
+    hostname: kafka-2
+    container_name: kafka-finding-2
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_RAFT_ELECTION_TIMEOUT_MS: 500
+      KAFKA_RAFT_FETCH_TIMEOUT_MS: 200
+      KAFKA_RAFT_RETRY_BACKOFF_MS: 50
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_MESSAGE_MAX_BYTES: 10000000000
+      KAFKA_NUM_NETWORK_THREADS: 3
+      KAFKA_NUM_IO_THREADS: 4
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      KAFKA_SUPER_USERS: "User:admin"
+    volumes:
+      - kafka-2-data:/var/lib/kafka/data
+    ports:
+      - "29092:9092"
+      - "29093:9093"
+
+  # ---- Controller/Broker Node 3 ----
+  kafka-3:
+    image: apache/kafka:3.9.0
+    hostname: kafka-3
+    container_name: kafka-finding-3
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_RAFT_ELECTION_TIMEOUT_MS: 500
+      KAFKA_RAFT_FETCH_TIMEOUT_MS: 200
+      KAFKA_RAFT_RETRY_BACKOFF_MS: 50
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_MESSAGE_MAX_BYTES: 10000000000
+      KAFKA_NUM_NETWORK_THREADS: 3
+      KAFKA_NUM_IO_THREADS: 4
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      KAFKA_SUPER_USERS: "User:admin"
+    volumes:
+      - kafka-3-data:/var/lib/kafka/data
+    ports:
+      - "39092:9092"
+      - "39093:9093"
+
+  # ---- Kafka Connect worker (vulnerable config) ----
+  connect:
+    image: apache/kafka:3.9.0
+    hostname: connect
+    container_name: kafka-connect-finding
+    depends_on:
+      - kafka-1
+      - kafka-2
+      - kafka-3
+    command:
+      - /opt/kafka/bin/connect-distributed.sh
+      - /opt/kafka/config/connect-distributed.properties
+    environment:
+      # Inject the vulnerable connect properties via env (overrides file)
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - ./kafka-connect-distributed.properties:/opt/kafka/config/connect-distributed.properties:ro
+      - /tmp/kafka-plugins:/opt/kafka/plugins:rw  # writable plugins dir for FINDING-003
+    ports:
+      - "8083:8083"   # Connect REST API — exposed for FINDING-004 testing
+
+  # ---- Test producer for FINDING-002 (acks=all) ----
+  # Send acks=all messages and trigger leadership churn to observe false ACKs
+  test-producer:
+    image: apache/kafka:3.9.0
+    container_name: kafka-test-producer
+    depends_on:
+      - kafka-1
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Create a test topic with RF=3, minISR=2
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka-1:9092 \
+          --create --topic finding-002-test \
+          --replication-factor 3 \
+          --config min.insync.replicas=2 \
+          --if-not-exists
+
+        # Produce with acks=all — these ACKs may be false during leader churn
+        while true; do
+          echo "msg-$$(date +%s%N)" | \
+          /opt/kafka/bin/kafka-console-producer.sh \
+            --bootstrap-server kafka-1:9092 \
+            --topic finding-002-test \
+            --producer-property acks=all \
+            --producer-property enable.idempotence=true
+          sleep 0.1
+        done
+    restart: on-failure
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+
+# ============================================================
+# Testing FINDING-002 (HWM TOCTOU):
+#   1. docker compose up -d
+#   2. Start test-producer (acks=all messages to finding-002-test)
+#   3. Trigger leader churn: docker compose restart kafka-1
+#   4. Monitor for messages present in producer ACK but absent from consumer
+#      kafka-console-consumer.sh --bootstrap-server localhost:19092 \
+#        --topic finding-002-test --from-beginning
+#   5. Compare producer sent count vs consumer received count
+#
+# Testing FINDING-005 (Epoch Asymmetry):
+#   1. docker compose up -d
+#   2. python3 payloads/finding-005-vote-epoch-craft.py localhost 19093 MkU3OEVBNTcwNTJENDM2Qk
+#   3. Observe vote rejection patterns in kafka-1 logs
+#
+# Testing FINDING-006 (ACL DENY Bypass):
+#   1. docker compose up -d
+#   2. bash payloads/finding-006-acl-deny-bypass.sh localhost:19092 ...
+#
+# Testing FINDING-007 (Int Overflow):
+#   1. docker compose up -d
+#   2. python3 payloads/finding-007-produce-overflow.py localhost:19092 overflow-test
+#
+# Testing FINDING-008 (NULL Deref):
+#   1. docker compose up -d
+#   2. python3 payloads/finding-008-null-deref-request.py localhost 19092
+#   3. docker logs kafka-finding-1 | grep NullPointerException
+# ============================================================
