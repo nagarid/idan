@@ -10,3 +10,4 @@ research/*/attacker_pod
 research/*/fuse_uring_poc
 # downloaded packages
 research/*/*.deb
+*.deb
