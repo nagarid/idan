@@ -9,7 +9,9 @@
 | Component | `PluginUtils`, `Plugins` (Connect runtime) |
 | Source Files | `connect/runtime/src/main/java/org/apache/kafka/connect/runtime/isolation/PluginUtils.java` (lines ~190–280), `Plugins.java` (lines ~1–684) |
 | Category | Remote Code Execution |
-| CVSS v3.1 Estimate | **8.8 HIGH** — `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` |
+| CVSS v3.1 Score | **8.8 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` |
+| CVSS Breakdown | ISCBase=0.9148, ISC=5.873, Exploit=2.835, Score=Roundup(8.708)=8.8 |
 | CWE | CWE-22: Path Traversal; CWE-502: Deserialization of Untrusted Data (via classloading) |
 | Requires Auth | LOW — requires write access to the declared plugin path OR a prior write primitive |
 | MSK Affected | YES — MSK Connect (custom plugins are customer-managed) |

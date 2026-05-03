@@ -10,7 +10,9 @@
 | Source File | `core/src/main/scala/kafka/network/RequestChannel.scala` |
 | Approximate Lines | 52 (`buffer` field), 65 (initial parse), 78–80 (conditional release), 202 (`toString`), 227–235 (`releaseBuffer`) |
 | Category | Remote Denial of Service — Broker Thread Crash |
-| CVSS v3.1 Estimate | **7.5 HIGH** — `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` |
+| CVSS v3.1 Score | **7.5 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` |
+| CVSS Breakdown | ISCBase=0.5600, ISC=3.595, Exploit=3.887, Score=Roundup(7.482)=7.5 |
 | CWE | CWE-476: NULL Pointer Dereference |
 | Requires Auth | NONE — any network client can send requests to the broker |
 | MSK Affected | YES — MSK brokers run standard Kafka with default thread pool sizes |

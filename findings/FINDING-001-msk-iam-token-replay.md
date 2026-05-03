@@ -10,7 +10,9 @@
 | Source File | `src/main/java/software/amazon/msk/auth/iam/internals/IAMOAuthBearerToken.java` |
 | Approximate Lines | 44–74 (constructor), 98–115 (handleCallback) |
 | Category | Authentication Bypass — Token Replay |
-| CVSS v3.1 Estimate | **7.5 HIGH** — `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` |
+| CVSS v3.1 Score | **7.4 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N` |
+| CVSS Breakdown | ISCBase=0.8064, ISC=5.177, Exploit=2.221, Score=Roundup(7.398)=7.4 |
 | CWE | CWE-613: Insufficient Session Expiration |
 | Requires Auth | NO — attacker needs a captured token, not active credentials |
 | MSK Affected | YES — all MSK clusters using IAM authentication |

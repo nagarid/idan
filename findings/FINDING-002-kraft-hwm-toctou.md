@@ -10,7 +10,9 @@
 | Source File | `raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java` |
 | Approximate Lines | ~1900–1955 (`onUpdateLeaderHighWatermark`), ~3580–3615 (`appendAsLeader`) |
 | Category | Data Integrity — False Durability / TOCTOU |
-| CVSS v3.1 Estimate | **8.1 HIGH** — `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:H` |
+| CVSS v3.1 Score | **7.4 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:H` |
+| CVSS Breakdown | ISCBase=0.8064, ISC=5.177, Exploit=2.221, Score=Roundup(7.398)=7.4 |
 | CWE | CWE-367: Time-of-check Time-of-use (TOCTOU) Race Condition |
 | Requires Auth | PARTIAL — requires ability to trigger leadership churn (network access or crafted messages) |
 | MSK Affected | YES — MSK Standard clusters using KRaft (Kafka 3.3+) |

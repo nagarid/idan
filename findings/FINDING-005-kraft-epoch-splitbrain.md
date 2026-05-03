@@ -10,7 +10,9 @@
 | Source File | `raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java` |
 | Approximate Lines | ~2700–2750 (vote request handler, `isIllegalEpoch` computation) |
 | Category | Distributed Consensus Bypass — Split-Brain Leadership |
-| CVSS v3.1 Estimate | **7.5 HIGH** — `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:H` |
+| CVSS v3.1 Score | **7.4 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:H` |
+| CVSS Breakdown | ISCBase=0.8064, ISC=5.177, Exploit=2.221, Score=Roundup(7.398)=7.4 |
 | CWE | CWE-362: Race Condition; CWE-670: Always-Incorrect Control Flow Implementation |
 | Requires Auth | NO — requires network access to the controller port (9093) |
 | MSK Affected | YES — MSK clusters running Kafka 3.3+ in KRaft mode |

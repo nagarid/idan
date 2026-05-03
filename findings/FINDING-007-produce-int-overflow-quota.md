@@ -10,7 +10,9 @@
 | Source File | `clients/src/main/java/org/apache/kafka/common/requests/ProduceRequest.java` |
 | Approximate Lines | 118–141 (`partitionSizes` method) |
 | Category | Privilege Escalation — Resource Quota Bypass |
-| CVSS v3.1 Estimate | **7.5 HIGH** — `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:H` |
+| CVSS v3.1 Score | **7.1 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:L/A:H` |
+| CVSS Breakdown | ISCBase=0.6568, ISC=4.217, Exploit=2.835, Score=Roundup(7.052)=7.1 |
 | CWE | CWE-190: Integer Overflow or Wraparound |
 | Requires Auth | LOW — requires a valid Kafka producer client |
 | MSK Affected | YES — MSK enforces per-client byte-rate quotas |

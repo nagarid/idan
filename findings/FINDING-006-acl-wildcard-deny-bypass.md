@@ -10,7 +10,9 @@
 | Source File | `metadata/src/main/java/org/apache/kafka/metadata/authorizer/StandardAuthorizerData.java` |
 | Approximate Lines | 280–330 (`authorize`), 400–420 (`matchingPrincipals`), 480–540 (`findResult`) |
 | Category | RBAC Bypass — ACL DENY Circumvention |
-| CVSS v3.1 Estimate | **7.5 HIGH** — `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` |
+| CVSS v3.1 Score | **8.1 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N` |
+| CVSS Breakdown | ISCBase=0.8064, ISC=5.177, Exploit=2.835, Score=Roundup(8.012)=8.1 |
 | CWE | CWE-732: Incorrect Permission Assignment for Critical Resource; CWE-269: Improper Privilege Management |
 | Requires Auth | LOW — requires a valid Kafka principal (any authenticated user) |
 | MSK Affected | YES — MSK clusters using StandardAuthorizer (KRaft mode, Kafka 3.3+) |

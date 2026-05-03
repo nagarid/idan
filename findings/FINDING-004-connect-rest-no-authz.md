@@ -10,7 +10,9 @@
 | Source File | `connect/runtime/src/main/java/org/apache/kafka/connect/runtime/rest/resources/ConnectorsResource.java` |
 | Approximate Lines | 1–407 (entire resource class) |
 | Category | RBAC Bypass — Missing Authorization |
-| CVSS v3.1 Estimate | **9.1 CRITICAL** — `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H` |
+| CVSS v3.1 Score | **9.8 CRITICAL** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H` |
+| CVSS Breakdown | ISCBase=0.9148, ISC=5.873, Exploit=3.887, Score=Roundup(9.760)=9.8 |
 | CWE | CWE-306: Missing Authentication for Critical Function; CWE-284: Improper Access Control |
 | Requires Auth | NONE — any network-reachable client can invoke all endpoints |
 | MSK Affected | YES — MSK Connect REST API within VPC |

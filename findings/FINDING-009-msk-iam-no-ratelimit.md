@@ -10,7 +10,9 @@
 | Source File | `src/main/java/software/amazon/msk/auth/iam/IAMOAuthBearerLoginCallbackHandler.java` |
 | Approximate Lines | 98–115 (`handleCallback`), 122–145 (`generateTokenValue`) |
 | Category | Denial of Service — Resource Amplification |
-| CVSS v3.1 Estimate | **6.5 MEDIUM** — `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` |
+| CVSS v3.1 Score | **7.5 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H` |
+| CVSS Breakdown | ISCBase=0.5600, ISC=3.595, Exploit=3.887, Score=Roundup(7.482)=7.5 |
 | CWE | CWE-400: Uncontrolled Resource Consumption |
 | Requires Auth | NONE — only requires TCP connectivity to broker port 9098 |
 | MSK Affected | YES — all MSK clusters using IAM authentication |

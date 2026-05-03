@@ -10,7 +10,9 @@
 | Source File | `connect/runtime/src/main/java/org/apache/kafka/connect/runtime/distributed/DistributedHerder.java` |
 | Approximate Lines | 1721–1730 (`isLeader`, `leaderUrl`), 186–220 (member variables) |
 | Category | RBAC Bypass — Unauthorized Cluster Leadership / Privilege Escalation |
-| CVSS v3.1 Estimate | **8.8 HIGH** — `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` |
+| CVSS v3.1 Score | **8.8 HIGH** |
+| CVSS v3.1 Vector | `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` |
+| CVSS Breakdown | ISCBase=0.9148, ISC=5.873, Exploit=2.835, Score=Roundup(8.708)=8.8 |
 | CWE | CWE-306: Missing Authentication for Critical Function; CWE-345: Insufficient Verification of Data Authenticity |
 | Requires Auth | LOW — requires WRITE ACL on Kafka internal Connect topics (`__connect-configs`) |
 | MSK Affected | YES — MSK Connect clusters using DistributedHerder (all MSK Connect deployments) |

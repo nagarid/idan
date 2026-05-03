@@ -10,17 +10,17 @@ All findings are novel — discovered through direct code reading, not derived f
 
 A source code audit of Apache Kafka trunk and the AWS MSK IAM authentication library identified **10 original vulnerability findings** spanning Remote Code Execution, RBAC/ACL bypass, authentication replay, data integrity violations, and denial of service. Several findings chain together for amplified impact in MSK Connect deployments.
 
-| ID | Title | Category | CVSS Est. | MSK Impact |
+| ID | Title | Category | CVSS v3.1 | MSK Impact |
 |----|-------|----------|-----------|------------|
-| [FINDING-001](#finding-001) | MSK IAM Token — Missing Server-Side Expiry | Auth Bypass | **7.5 HIGH** | All MSK IAM clusters |
-| [FINDING-002](#finding-002) | KRaft HWM TOCTOU — False Durability | Data Integrity | **8.1 HIGH** | MSK Standard (KRaft) |
+| [FINDING-001](#finding-001) | MSK IAM Token — Missing Server-Side Expiry | Auth Bypass | **7.4 HIGH** | All MSK IAM clusters |
+| [FINDING-002](#finding-002) | KRaft HWM TOCTOU — False Durability | Data Integrity | **7.4 HIGH** | MSK Standard (KRaft) |
 | [FINDING-003](#finding-003) | Connect Plugin Symlink → RCE | RCE | **8.8 HIGH** | MSK Connect |
-| [FINDING-004](#finding-004) | Connect REST API — No Authorization | RBAC Bypass | **9.1 CRITICAL** | MSK Connect |
-| [FINDING-005](#finding-005) | KRaft Epoch Asymmetry — Split-Brain | Consensus Bypass | **7.5 HIGH** | MSK Standard (KRaft) |
-| [FINDING-006](#finding-006) | ACL Wildcard DENY Bypass | RBAC Bypass | **7.5 HIGH** | MSK + StandardAuthorizer |
-| [FINDING-007](#finding-007) | ProduceRequest Int Overflow → Quota Bypass | Privilege Escalation | **7.5 HIGH** | All MSK clusters |
+| [FINDING-004](#finding-004) | Connect REST API — No Authorization | RBAC Bypass | **9.8 CRITICAL** | MSK Connect |
+| [FINDING-005](#finding-005) | KRaft Epoch Asymmetry — Split-Brain | Consensus Bypass | **7.4 HIGH** | MSK Standard (KRaft) |
+| [FINDING-006](#finding-006) | ACL Wildcard DENY Bypass | RBAC Bypass | **8.1 HIGH** | MSK + StandardAuthorizer |
+| [FINDING-007](#finding-007) | ProduceRequest Int Overflow → Quota Bypass | Privilege Escalation | **7.1 HIGH** | All MSK clusters |
 | [FINDING-008](#finding-008) | RequestChannel NULL Deref → Broker Crash | Remote DoS | **7.5 HIGH** | All MSK clusters |
-| [FINDING-009](#finding-009) | MSK IAM — No Auth Rate Limiting → DoS Amp | Denial of Service | **6.5 MEDIUM** | All MSK IAM clusters |
+| [FINDING-009](#finding-009) | MSK IAM — No Auth Rate Limiting → DoS Amp | Denial of Service | **7.5 HIGH** | All MSK IAM clusters |
 | [FINDING-010](#finding-010) | DistributedHerder Non-Crypto Leader → Takeover | RBAC Bypass | **8.8 HIGH** | MSK Connect |
 
 ---
@@ -28,11 +28,12 @@ A source code audit of Apache Kafka trunk and the AWS MSK IAM authentication lib
 ## Severity Matrix
 
 ```
-CRITICAL (9.0+)  ████████████████████  FINDING-004 (9.1)
+CRITICAL (9.0+)  ████████████████████  FINDING-004 (9.8)
 HIGH     (7.0+)  ██████████████████    FINDING-003 (8.8), FINDING-010 (8.8)
-                 ████████████████      FINDING-002 (8.1)
-                 █████████████         FINDING-001, FINDING-005, FINDING-006, FINDING-007, FINDING-008 (7.5)
-MEDIUM   (4.0+)  ████████              FINDING-009 (6.5)
+                 ████████████████      FINDING-006 (8.1)
+                 █████████████         FINDING-008 (7.5), FINDING-009 (7.5)
+                 ████████████          FINDING-001 (7.4), FINDING-002 (7.4), FINDING-005 (7.4)
+                 ███████████           FINDING-007 (7.1)
 ```
 
 ---
