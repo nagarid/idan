@@ -24,11 +24,12 @@ When path B's LOOKUP updates the shared inode's mode, path A's dentry is still
 valid (`entry_valid` not expired) and will be served from the dentry cache
 **without issuing a new FUSE_LOOKUP**. The kernel uses the now-poisoned inode.
 
-## Attack Scenario
+## Attack Scenarios
+
+### Generic (original PoC: fuse_alias_poc.c)
 
 ```
-Attacker controls a FUSE server (e.g., libfuse-based userspace daemon).
-Two exported paths return the same nodeid with different modes:
+A FUSE server assigns two paths the same nodeid with different modes:
 
   world_read → nodeid=10, mode=0644, entry_valid=3600s
   root_only  → nodeid=10, mode=0000, entry_valid=3600s
@@ -41,6 +42,56 @@ Attack sequence:
      → dentry "root_only" still valid (no new LOOKUP)
      → kernel checks inode 10 mode = 0644 → ALLOWS uid=1 access
 ```
+
+### Realistic: Kubernetes Secrets Store CSI Driver (victim_csi.sh / attacker_pod.c)
+
+A content-addressed FUSE secrets driver uses `MD5(secret_value)` as the nodeid,
+intended to deduplicate identical secrets across pods. Two secrets that happen to
+contain the same value produce the same hash → the same FUSE nodeid.
+
+**Setup:**
+```
+Secret:  dev-shared-key   value="ProdDevKey#7x9\n"  mode=0644  (dev team)
+Secret:  prod-db-password value="ProdDevKey#7x9\n"  mode=0000  (app-sa only)
+
+MD5("ProdDevKey#7x9\n")[:8] = 0x651b3722d014767b  ← same nodeid for both!
+```
+
+**Why this collision is realistic:**
+- Developers reuse test credentials across environments — same secret value
+  can appear under multiple names with different access policies.
+- Content-addressed storage is a natural optimization in secrets backends that
+  serve many pods; if two pods' secrets resolve to the same backing store entry,
+  a single caching nodeid is tempting.
+
+**Attack (uid=65534, no sudo, no capabilities):**
+```
+PRE-CHECK: open(prod-db-password) = DENIED (Permission denied)  ← correct
+
+Step 1: stat(prod-db-password)
+        → FUSE_LOOKUP → daemon: nodeid=0x651b..., mode=0000
+        → kernel creates inode 0x651b... with mode=0000
+
+Step 2: stat(dev-shared-key)
+        → FUSE_LOOKUP → daemon: nodeid=0x651b..., mode=0644
+        → kernel finds existing inode 0x651b... → fuse_change_attributes()
+        → inode mode: 0000 → 0644                           ← POISONED
+
+Step 3: stat(prod-db-password) [dentry still cached, no LOOKUP sent]
+        → kernel reads inode 0x651b... mode=0644            ← poison confirmed
+
+Step 4: open(prod-db-password, O_RDONLY) as uid=65534
+        → kernel: inode mode=0644, other=r → ALLOWED
+        → read 15 bytes: ProdDevKey#7x9                     ← BYPASS!
+
+Syscalls used: stat, stat, open  — no exploit code needed
+```
+
+**Note on fuse-overlayfs (Podman rootless):** fuse-overlayfs 1.13 uses `(st_dev,
+st_ino)` as its inode key, so two files on different devices with the same `st_ino`
+do NOT collide. Hardlinks share one host inode → same nodeid, but also same mode,
+which cannot produce the mode-difference required for the attack. The CSI driver
+scenario above is the realistic trigger.
 
 ## Conditions Required
 
@@ -88,9 +139,12 @@ correct per-path checks.
 4. User reads/executes files they should have no access to
 
 **Real-world examples where this applies:**
+- Kubernetes Secrets Store CSI drivers with content-hash nodeid assignment
 - libfuse-based filesystems with virtual/synthetic inodes (overlayfs-style)
 - FUSE bindings that use inode numbers from an upstream source (e.g., NFS over FUSE)
-- Container runtimes with FUSE-based rootfs layers
+- Container runtimes with FUSE-based rootfs layers where lower-layer hardlinks
+  are visible in the merged view (same nodeid, but same mode — not directly
+  exploitable without additional per-path ACL logic)
 
 ## Mitigation
 

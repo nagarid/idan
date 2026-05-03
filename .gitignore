@@ -6,6 +6,7 @@ research/*/fuse_poc
 research/*/io_uring_poc
 research/*/nft_poc
 research/*/fuse_alias_poc
+research/*/attacker_pod
 research/*/fuse_uring_poc
 # downloaded packages
 research/*/*.deb
