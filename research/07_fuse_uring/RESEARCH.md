@@ -407,3 +407,106 @@ All addresses verified on kernel 6.18.5:
 | `fuse_uring_stop_list_entries`  | (called from +0xa5 of stop_queues) | spinlock at +0xc |
 | `fuse_put_request`              | verified via `lock xadd [rdi+0x28]` | |
 | `fuse_request_alloc`            | refcount=1 at `mov [r12+0x28], 1`  | |
+
+---
+
+## Exploitation Primitive: req_B UAF via Stale Pending Hash (`fuse_uring_exploit.c`)
+
+### Three-Way Race for req_B Reallocation
+
+The double `fuse_put_request` enables a secondary exploitation primitive when heap
+grooming is applied. The key is the timing window **between FREE #1 and FREE #2**:
+
+```
+[CPU 1] fuse_uring_stop_list_entries:
+   spin_lock
+   ring_ent->state = FUSE_URING_ENT_STOPPING   (= 5)
+   req_A = ring_ent->req
+   ring_ent->req = NULL
+   fuse_request_end(req_A)                       ← FREE #1: req_A → slab freelist
+   spin_unlock                                   ← CPU 0 can now acquire
+
+[CPU 0] fuse_uring_commit_fetch (reads FC_Q_FORGET=0 pre-race):
+   spin_lock                                     ← acquires after CPU 1 releases
+   WARN_ON(ring_ent->state != IN_USERSPACE)      ← sees state=5 → WARN
+   spin_unlock
+   fuse_uring_req_end(ring_ent, req_A, -EPROTO)
+     → fuse_request_end(req_A)                  ← FREE #2: UAF on freed slab
+       → test_and_set_bit(FR_FINISHED, flags+0x30)
+       → refcount_dec_and_test(count+0x28)
+       → if count→0: fuse_request_free(req_A)
+
+[CPU 1 / any CPU] WINDOW between FREE #1 and FREE #2 (~100–300 ns):
+   child stat() → fuse_request_alloc → req_B at req_A's freed slab slot
+   req_B->count = 1, req_B->flags = 0 (fresh allocation)
+```
+
+When req_B occupies the freed slot, CPU 0's FREE #2 fires on req_B:
+- `test_and_set_bit(9, &req_B->flags)` → returns 0 → proceeds (no guard)
+- `refcount_dec_and_test(&req_B->count)` → 1 → 0 → `fuse_request_free(req_B)` ← **premature free**
+
+### Stale Pending Hash Entry
+
+After req_B is prematurely freed:
+- `commit_id_B` (= `req_B->in.h.unique`) is **still live** in the FUSE pending hash
+- The ring CQE delivers `commit_id_B` to userspace before the abort completes
+- Userspace submits `CAF(commit_id_B)` → kernel `fuse_request_find(commit_id_B)` → **freed req_B ptr**
+- `fuse_uring_commit_fetch` processes freed req_B → **type confusion / UAF**
+
+```
+pending_hash[commit_id_B] → freed req_B address
+                               ↑
+                   next allocation → req_C here
+                               ↑
+CAF(commit_id_B) dereferences req_C as if it were req_B
+```
+
+### Observable Indicators (without preempt=full)
+
+With `init_on_free=1` (confirmed in this environment): freed req_A is zeroed. If
+req_B does NOT land at the freed slot (no timing alignment), CPU 0's FREE #2 hits
+zeroed memory:
+- `req->count = 0` → `refcount_dec_and_test` → underflow → `refcount_t: underflow; use-after-free` in dmesg
+- Confirmed by `CONFIG_REFCOUNT_FULL=y` (default since 5.5)
+
+If req_B DOES land (tight timing, preempt=full): no refcount warning (count=1 decrements
+cleanly). The silent premature free of req_B is the primitive.
+
+### Heap Grooming Strategy (`fuse_uring_exploit.c`)
+
+```
+fuse_req_cachep: 168 bytes, 24 objects per order-0 page
+
+Phase 2 — Grooming:
+  1. Open NQ_GROOM=24 ring queues simultaneously
+  2. All 24 REGISTER CQEs arrive → 24 fuse_req objects allocated (likely one page)
+  3. Respond to 23 of them (CAF with valid response) → 23 freed, 1 active (req_A)
+  4. Page state: 23 free slots, 1 occupied = req_A at slot [k]
+
+Phase 3 — Race fires:
+  FREE #1: CPU 1 frees req_A → page has 24 free slots
+  init_on_free=1: slot [k] zeroed
+  Window: CPU 1 child on CPU 1 gets slot [k] as req_B (LIFO per-CPU freelist)
+
+Phase 4 — Capture commit_id_B:
+  ring CQE delivers commit_id_B before abort flag propagates to ring->fetch path
+  commit_id_B saved in exploit state
+
+Phase 5 — Stale CAF:
+  CAF(commit_id_B) submitted → fuse_request_find → freed req_B ptr → UAF
+```
+
+### Full LPE Path (preempt=full required)
+
+Once the req_B UAF is established via the stale hash entry:
+
+1. **Spray freed req_B slot** with a controlled kernel object
+   - Same cache (168 bytes): another `fuse_req` with crafted fields
+   - Cross-cache: drain all 24 fuse_req page → buddy → spray `msg_msg` (kmalloc-192) or `struct pipe_buffer` payload
+2. **CAF(commit_id_B)** → `fuse_request_find` → controlled object
+3. `fuse_uring_commit_fetch` dereferences `ring_ent` pointer from controlled object
+4. Crafted `ring_ent` → crafted `req` pointer → arbitrary kernel r/w via:
+   - `test_and_set_bit(9, controlled_addr+0x30)` → single bit write anywhere
+   - `refcount_dec_and_test(controlled_addr+0x28)` → decrement anywhere
+5. Target: `struct cred->cap_effective` via bit-set → `cap_effective = CAP_FULL_SET`
+   → `setuid(0)` → root shell

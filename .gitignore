@@ -11,6 +11,7 @@ research/*/fuse_alias_poc
 research/*/attacker_pod
 research/*/fuse_uring_poc
 research/*/fuse_uring_race
+research/*/fuse_uring_exploit
 # downloaded packages
 research/*/*.deb
 *.deb
