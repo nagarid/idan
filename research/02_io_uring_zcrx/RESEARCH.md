@@ -291,14 +291,26 @@ without bare-metal or SR-IOV passthrough hardware.
 
 ### Attack Surface Analysis
 
-Even though the full ZCRX path is gated by `CAP_NET_ADMIN`, there are
-pre-privilege-check code paths worth examining:
+The full ZCRX path is gated by `CAP_NET_ADMIN`. Disassembly of
+`io_register_zcrx_ifq` (0xffffffff818a4fa0) on kernel 6.18.5 confirms:
 
-- `io_zcrx_area_alloc` performs `pin_user_pages_fast` on the
-  attacker-supplied `area_reg.addr/len` before the privilege check.
-  A TOCTOU between `copy_from_user` on `ifq_reg` and the subsequent
-  `pin_user_pages_fast` is theoretically possible if the syscall copies
-  the struct in pieces.
+```asm
+ffffffff818a4fb0:  mov $0xc,%edi          ; CAP_NET_ADMIN = 12
+ffffffff818a4fe7:  call capable           ; privilege check — FIRST call
+ffffffff818a4fec:  test %al,%al
+ffffffff818a4fee:  je 0xffffffff818a5471  ; not capable → -EPERM
+[only after passing capability check:]
+ffffffff818a501d:  call copy_from_user    ; 0x60 bytes of ifq_reg
+ffffffff818a503b:  call copy_from_user    ; 0x40 bytes of area_reg
+```
+
+`io_zcrx_create_area` calls `io_validate_user_buf_range` (not
+`pin_user_pages_fast`) — there is no page-pinning before the capability
+check in this kernel version.
+
+**The pre-auth `pin_user_pages_fast` claim is incorrect for 6.18.5.**
+
+Remaining angle worth noting:
 - The `rq_area_token` field is an opaque kernel pointer written back to
   userspace in `region_ptr`; leaking this value from a privileged process
   could reveal a kernel VA even with `kptr_restrict=2`.
@@ -379,10 +391,12 @@ For a real refcount race, use `IORING_OP_READV` or `IORING_OP_OPENAT`
    checking (e.g., 32-bit or with a mapped physical region), this could
    be an exploitable read/write primitive.
 
-3. **ZCRX pre-auth exposure**: `io_zcrx_area_alloc` calls
-   `pin_user_pages_fast` before the privilege check in some kernel
-   versions.  This is worth auditing across kernel versions for TOCTOU or
-   page-pinning-based exploits accessible without `CAP_NET_ADMIN`.
+3. **ZCRX pre-auth claim DISPROVED on 6.18.5**: Disassembly of
+   `io_register_zcrx_ifq` confirms `capable(CAP_NET_ADMIN)` is the first
+   call; `pin_user_pages_fast` does not execute before it.
+   `io_zcrx_create_area` calls `io_validate_user_buf_range`, not
+   `pin_user_pages_fast`.  Earlier-kernel claims of pre-auth page-pinning
+   do not apply here.
 
 4. **CQ overflow silent drop**: with a small CQ ring (128 entries for
    64-SQ) and no consumer, CQEs are silently dropped after overflow.  The
