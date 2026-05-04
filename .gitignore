@@ -10,6 +10,7 @@ research/*/nft_research2
 research/*/fuse_alias_poc
 research/*/attacker_pod
 research/*/fuse_uring_poc
+research/*/fuse_uring_race
 # downloaded packages
 research/*/*.deb
 *.deb
