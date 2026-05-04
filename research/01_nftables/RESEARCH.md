@@ -26,21 +26,44 @@ nfnetlink_rcv_batch()          ← single mutex for entire batch
 
 ## High-Value Targets
 
-### 1. pipapo COW + GC timer race
+### 1. nft_trans_gc pipeline — analysis and confirmed non-exploitability
 
-`nft_set_pipapo` (interval sets, >= 5.6) uses copy-on-write for atomic updates:
-- `nft_pipapo_commit()` → `nft_set_pipapo_activate()` swaps working copy via RCU
-- GC timer: `nft_set_pipapo_gc()` fires independently, walks elements
+**Initial hypothesis (INCORRECT):** `nft_trans_gc_elem_add()` stores expired elements
+without a bounds check, allowing >507 elements to overflow a kmalloc-4k slab boundary.
 
-Race window:
-1. GC fires, acquires RCU read lock, starts walking match->f[i].rules
-2. Transaction starts, creates pipapo clone via `pipapo_clone()`
-3. Transaction commits, `nft_pipapo_commit()` does `rcu_assign_pointer(priv->match, clone)`
-4. RCU grace period starts - OLD match memory still valid
-5. GC continues on old match, calls `nft_set_elem_destroy()` on elem
-6. Same elem exists in clone, double-free path IF refcounting is wrong
+**Disassembly findings (kernel 6.18.5, via /proc/kcore):**
 
-Relevant functions: `nft_set_pipapo_gc`, `pipapo_clone`, `nft_pipapo_commit`
+`nft_trans_gc_alloc` (0xffffffff81c32ab0) calls `kmalloc(0x838, GFP_KERNEL|GFP_ZERO)`:
+- Requested size: 0x838 = 2104 bytes → kmalloc-4k slab object = **4096 bytes**
+- Header size: 40 bytes (gc->count is a u16 at offset 0x24; gc->elems[] starts at 0x28)
+- Theoretical elements before slab OOB: (4096 - 40) / 8 = **507**
+- Theoretical elements before alloc OOB: (2104 - 40) / 8 = **258**
+
+`nft_trans_gc_elem_add` (0xffffffff81c32bd0): confirmed NO internal bounds check:
+```asm
+movzwl 0x24(%rdi),%eax  ; count = gc->count
+lea    0x1(%rax),%edx
+mov    %dx,0x24(%rdi)   ; gc->count++
+mov    %rsi,0x28(%rdi,%rax,8) ; gc->elems[count] = elem ← NO CHECK
+ret
+```
+
+**Effective bounds check — NFT_TRANS_GC_BATCHCOUNT = 0x100 = 256:**
+- `nft_trans_gc_queue_sync` (0xffffffff81c32d70): `cmpw $0x100, 0x24(%rdi); je flush`
+- `nft_trans_gc_queue_async` (0xffffffff81c32c00): identical check
+- All 7 callers of elem_add (pipapo_gc, nft_rbtree_gc×2, __nft_rbtree_insert×3,
+  nft_rhash_gc) call queue_sync or queue_async BEFORE elem_add
+- With 256 elements: last write at 40 + 255×8 = **2080 bytes** < 2104 ✓ No OOB
+
+**GC trigger model:**
+- `nft_pipapo_gc_init` / `nft_rbtree_gc_init`: both just write jiffies to last_gc. NO timer.
+- `nft_pipapo_commit` / `nft_rbtree_commit`: call GC inline after `jiffies - last_gc >= gc_interval`.
+- GC runs exclusively under `nfnl_lock` (single-threaded). No race condition possible.
+
+**Conclusion:** No exploitable bug in this path. The 256-element batch limit prevents OOB.
+Any overflow attempt (e.g. 520 elements) results in ceil(520/256) = 3 safe gc transactions.
+
+### 2. nft_verdict chain binding counter during concurrent transactions
 
 ### 2. nft_verdict chain binding counter during concurrent transactions
 
@@ -92,15 +115,36 @@ Standard kernel heap exploit path:
 - CONFIG_STACKPROTECTOR_STRONG=y
 - CONFIG_SECURITY_LANDLOCK=n (absent — no landlock restriction to bypass)
 
-## Test Results (nft_poc.c, kernel 6.18.5)
+## Test Results (nft_poc.c + nft_gc_oob.c investigation, kernel 6.18.5)
 
 | Test | Status | Notes |
 |------|--------|-------|
-| pipapo GC race | No crash | 384/512 elements added; no KASAN triggered |
+| pipapo GC race | Not reproducible | GC is commit-triggered under nfnl_lock; no timer race |
 | rbtree abort | No crash | EEXIST returned correctly; abort path not triggered |
 | dynset 1ms timeout | Clean | Elements expired and re-added cleanly |
 | concurrent transactions | No crash | Two sockets, concurrent ops; no anomalies |
 | heap spray | 64 sets / 32 freed | Slab hole creation works |
+| nft_trans_gc OOB (nft_gc_oob.c) | Not reproducible | NFT_TRANS_GC_BATCHCOUNT=256 prevents OOB; incorrect analysis |
+
+## nft_gc_oob.c Analysis (Post-Mortem)
+
+`nft_gc_oob.c` was written to trigger an OOB write via pipapo GC processing 520 expired
+elements. **The bug does not exist** for the following confirmed reasons:
+
+1. **NFT_TRANS_GC_BATCHCOUNT = 256** (not unbounded as assumed):
+   Both `nft_trans_gc_queue_sync` and `nft_trans_gc_queue_async` compare `gc->count`
+   against 0x100 = 256 before each element addition. When count reaches 256, the current
+   gc is flushed and a new one allocated. 520 elements → 3 transactions (256, 256, 8).
+
+2. **No GC timer**: `nft_pipapo_gc_init` only initializes `last_gc = jiffies`. The
+   pipapo GC runs inline in `nft_pipapo_commit()` under `nfnl_lock`.
+
+3. **256 < 258 elements fits within 2104-byte allocation**: Even without queue_sync, the
+   2104-byte struct can safely hold (2104-40)/8 = 258 elements before overflowing its
+   own allocation, far below the 507-element slab boundary.
+
+The heap grooming approach (msg_msg spray + pipapo_gc) also failed due to SLAB_FREELIST_RANDOM
+shuffling slab object order — physical adjacency assumptions were incorrect.
 
 ## Protocol Notes (Raw Netlink Encoding)
 
