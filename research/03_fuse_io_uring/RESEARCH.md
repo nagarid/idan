@@ -103,11 +103,14 @@ cache invalidation, this can produce stale dentries pointing to wrong inodes.
 not `ns_capable(CAP_SYS_ADMIN)`. Unprivileged attacker with CAP_SYS_ADMIN
 in a user namespace cannot use passthrough. Correct security boundary.
 
-### io_uring FUSE not exposed via ioctl at op=3
-The `FUSE_DEV_IOC_URING_CMD` ioctl number I probed doesn't exist. The
-CONFIG_FUSE_IO_URING path is probably activated via a different mechanism
-(likely via a fuse_dev_operations variant or a separate connection setup).
-Further research needed to identify the actual registration path.
+### io_uring FUSE not exposed via ioctl at op=3 — actual path found in area 07
+The `FUSE_DEV_IOC_URING_CMD` ioctl number does not exist. The
+`CONFIG_FUSE_IO_URING` path is activated via `IORING_OP_URING_CMD` SQE on
+the `/dev/fuse` fd (not a device ioctl). The registration command is
+`FUSE_IO_URING_CMD_REGISTER = 1` placed in the 128-byte SQE's `cmd[]` area
+with `sqe->addr` pointing to a `struct iovec[2]`. See `07_fuse_uring/` for
+the full reverse-engineered protocol including the deferred-CQE quirk and
+teardown race analysis.
 
 ### TOCTOU race window is daemon-controlled
 The FUSE daemon can inject arbitrary delays at any point in the protocol.
