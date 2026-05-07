@@ -109,14 +109,6 @@ else
     ok "Cluster ready"
 fi
 
-export KUBECONFIG
-KUBECONFIG="$(kind get kubeconfig --name "$CLUSTER_NAME" 2>/dev/null \
-    | grep -o 'KUBECONFIG=.*' | cut -d= -f2 || \
-    kind get kubeconfig --name "$CLUSTER_NAME" > /tmp/kubeconfig-cve-demo && echo /tmp/kubeconfig-cve-demo)"
-KUBECONFIG=$(kind get kubeconfig --name "$CLUSTER_NAME" 2>&1 \
-    | grep -v '^#' | head -1 || echo "")
-
-# Better approach: write kubeconfig to file
 kind get kubeconfig --name "$CLUSTER_NAME" > /tmp/kubeconfig-cve-demo
 export KUBECONFIG=/tmp/kubeconfig-cve-demo
 

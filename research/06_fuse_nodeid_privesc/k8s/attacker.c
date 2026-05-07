@@ -127,6 +127,9 @@ int main(void)
     char buf[256] = {0};
     ssize_t nr = read(fd, buf, sizeof(buf) - 1);
     close(fd);
+    /* Strip trailing newline — secret value ends with \n which would break
+     * the fixed-width box output below. */
+    if (nr > 0 && buf[nr - 1] == '\n') buf[--nr] = '\0';
 
     printf("    ┌──────────────────────────────────────────────────────────┐\n");
     printf("    │  open(prod-db-password)  =  OPENED   ← BYPASS!          │\n");

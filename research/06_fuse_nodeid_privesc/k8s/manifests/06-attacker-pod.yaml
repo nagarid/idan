@@ -11,6 +11,9 @@ metadata:
     role: exploit-demo
 spec:
   serviceAccountName: dev-sa
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
   securityContext:
     runAsUser: 1000
     runAsGroup: 1000
@@ -27,6 +30,7 @@ spec:
     volumeMounts:
     - name: secrets
       mountPath: /secrets
+      mountPropagation: HostToContainer
   volumes:
   - name: secrets
     hostPath:

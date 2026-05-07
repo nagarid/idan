@@ -11,6 +11,11 @@ metadata:
     role: legitimate-user
 spec:
   serviceAccountName: dev-sa
+  # Toleration required: kind single-node cluster taints the control-plane node
+  # with NoSchedule; without this the pod stays Pending forever.
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
   securityContext:
     runAsUser: 1000
     runAsGroup: 1000
@@ -27,6 +32,9 @@ spec:
     - name: secrets
       mountPath: /secrets
       readOnly: true
+      # HostToContainer (rslave): if the CSI FUSE mount is recreated on the
+      # host after this pod starts, the new mount propagates into the pod.
+      mountPropagation: HostToContainer
   volumes:
   - name: secrets
     hostPath:
