@@ -1,0 +1,9 @@
+FROM gcc:13-bookworm AS builder
+COPY attacker.c /src/attacker.c
+RUN gcc -O2 -Wall -Wno-unused-result -static -o /attacker /src/attacker.c
+
+FROM debian:bookworm-slim
+COPY --from=builder /attacker /attacker
+# Run as uid=1000 — simulates a non-root pod process
+USER 1000
+ENTRYPOINT ["/attacker"]

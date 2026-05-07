@@ -1,0 +1,64 @@
+# Simulated Secrets Store CSI driver — runs as a privileged DaemonSet.
+# Mounts a FUSE filesystem at /var/lib/csi-demo-secrets on each node.
+# Uses content-addressed nodeids (the vulnerability).
+# Mount propagation: Bidirectional — FUSE mount visible to pods via hostPath.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: csi-fuse-driver
+  namespace: cve-demo
+  labels:
+    app: csi-fuse-driver
+spec:
+  selector:
+    matchLabels:
+      app: csi-fuse-driver
+  template:
+    metadata:
+      labels:
+        app: csi-fuse-driver
+    spec:
+      hostPID: false
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      initContainers:
+      - name: mkdir
+        image: busybox:1.36
+        command: ["mkdir", "-p", "/hostdir"]
+        volumeMounts:
+        - name: secrets-dir
+          mountPath: /hostdir
+      containers:
+      - name: fuse-daemon
+        image: csi-fuse-driver:demo
+        imagePullPolicy: Never
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        env:
+        - name: READY_FILE
+          value: /tmp/csi-ready
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        args: ["/var/lib/csi-demo-secrets"]
+        readinessProbe:
+          exec:
+            command: ["test", "-f", "/tmp/csi-ready"]
+          initialDelaySeconds: 2
+          periodSeconds: 1
+          failureThreshold: 30
+        volumeMounts:
+        - name: dev-fuse
+          mountPath: /dev/fuse
+        - name: secrets-dir
+          mountPath: /var/lib/csi-demo-secrets
+          mountPropagation: Bidirectional
+      volumes:
+      - name: dev-fuse
+        hostPath:
+          path: /dev/fuse
+      - name: secrets-dir
+        hostPath:
+          path: /var/lib/csi-demo-secrets
+          type: DirectoryOrCreate

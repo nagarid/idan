@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fuse3 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY csi_fuse_daemon.py /usr/local/bin/csi_fuse_daemon.py
+RUN chmod +x /usr/local/bin/csi_fuse_daemon.py
+
+ENTRYPOINT ["python3", "/usr/local/bin/csi_fuse_daemon.py"]

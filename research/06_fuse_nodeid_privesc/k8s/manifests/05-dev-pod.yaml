@@ -1,0 +1,34 @@
+# Legitimate dev-team pod.
+# Service account: dev-sa (RBAC allows dev-shared-key, denies prod-db-password)
+# Demonstrates that the CSI secrets volume is working correctly for normal use.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dev-pod
+  namespace: cve-demo
+  labels:
+    app: dev-pod
+    role: legitimate-user
+spec:
+  serviceAccountName: dev-sa
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+  containers:
+  - name: dev-container
+    image: debian:bookworm-slim
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "3600"]
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+      runAsNonRoot: true
+    volumeMounts:
+    - name: secrets
+      mountPath: /secrets
+      readOnly: true
+  volumes:
+  - name: secrets
+    hostPath:
+      path: /var/lib/csi-demo-secrets
+      type: Directory

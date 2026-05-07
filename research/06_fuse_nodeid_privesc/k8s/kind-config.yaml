@@ -1,0 +1,16 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: cve-demo
+nodes:
+- role: control-plane
+  # Expose /dev/fuse into the kind node so privileged pods can mount FUSE.
+  extraMounts:
+  - hostPath: /dev/fuse
+    containerPath: /dev/fuse
+  # Allow privileged containers and hostPath volumes (needed for CSI driver).
+  kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        allow-privileged: "true"

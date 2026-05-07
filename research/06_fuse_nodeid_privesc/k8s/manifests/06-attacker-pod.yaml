@@ -1,0 +1,34 @@
+# Attacker pod — same service account as dev-pod (dev-sa).
+# RBAC denies prod-db-password access for dev-sa.
+# This pod runs the exploit: stat+stat+open bypasses the FUSE mode=0000 check.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: attacker-pod
+  namespace: cve-demo
+  labels:
+    app: attacker-pod
+    role: exploit-demo
+spec:
+  serviceAccountName: dev-sa
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+  containers:
+  - name: attacker
+    image: csi-attacker:demo
+    imagePullPolicy: Never
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      runAsNonRoot: true
+    # Keep the pod running so we can exec into it interactively.
+    command: ["sleep", "3600"]
+    volumeMounts:
+    - name: secrets
+      mountPath: /secrets
+  volumes:
+  - name: secrets
+    hostPath:
+      path: /var/lib/csi-demo-secrets
+      type: Directory

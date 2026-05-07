@@ -1,0 +1,67 @@
+# Service account used by both dev-pod and attacker-pod.
+# RBAC grants access to dev-shared-key ONLY.
+# prod-db-password is intentionally excluded — dev-sa must not read it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dev-sa
+  namespace: cve-demo
+---
+# Service account for the application pod (legitimate prod-db-password access).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-sa
+  namespace: cve-demo
+---
+# dev-sa Role: read dev-shared-key only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-secrets-reader
+  namespace: cve-demo
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["dev-shared-key"]
+  verbs: ["get"]
+---
+# app-sa Role: read prod-db-password only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: app-secrets-reader
+  namespace: cve-demo
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["prod-db-password"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-sa-binding
+  namespace: cve-demo
+subjects:
+- kind: ServiceAccount
+  name: dev-sa
+  namespace: cve-demo
+roleRef:
+  kind: Role
+  name: dev-secrets-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: app-sa-binding
+  namespace: cve-demo
+subjects:
+- kind: ServiceAccount
+  name: app-sa
+  namespace: cve-demo
+roleRef:
+  kind: Role
+  name: app-secrets-reader
+  apiGroup: rbac.authorization.k8s.io
