@@ -103,7 +103,12 @@ int tap_egress(struct __sk_buff *skb)
 char LICENSE[] SEC("license") = "GPL";
 EOF
 atk "Compiling tap.bpf.c → tap.bpf.o  ($CLANG -target bpf)"
-$CLANG -O2 -target bpf -c /tmp/tap.bpf.c -o /tmp/tap.bpf.o
+# -I/usr/include/x86_64-linux-gnu needed so clang finds asm/types.h when
+# cross-compiling to BPF target on amd64 Ubuntu
+$CLANG -O2 -target bpf \
+    -I/usr/include/x86_64-linux-gnu \
+    -c /tmp/tap.bpf.c -o /tmp/tap.bpf.o \
+    || { echo -e "${RED}[ERROR] BPF compilation failed — aborting${NC}"; exit 1; }
 ok "tap.bpf.o compiled — BPF bytecode ready"
 
 # ── Phase 2: write tap_reader.c ────────────────────────────────────────────
