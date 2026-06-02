@@ -102,6 +102,7 @@ int tap_egress(struct __sk_buff *skb)
 
 char LICENSE[] SEC("license") = "GPL";
 EOF
+sudo rm -f /tmp/tap.bpf.o /tmp/tap_reader
 atk "Compiling tap.bpf.c → tap.bpf.o  ($CLANG -target bpf)"
 # -I/usr/include/x86_64-linux-gnu needed so clang finds asm/types.h when
 # cross-compiling to BPF target on amd64 Ubuntu
