@@ -92,7 +92,6 @@ int tap_egress(struct __sk_buff *skb)
     struct capture_t cap = {};
     cap.remote_ip   = skb->remote_ip4;
     cap.remote_port = (__u16)(__builtin_bswap32(skb->remote_port) >> 16);
-    bpf_get_current_comm(cap.comm, sizeof(cap.comm));
     bpf_map_update_elem(&cap_map, &slot, &cap, 0);
 
     __u32 nxt = *idx + 1;
