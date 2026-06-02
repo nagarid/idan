@@ -61,7 +61,6 @@ cat > /tmp/tap.bpf.c << 'EOF'
 struct capture_t {
     __u32 remote_ip;
     __u32 remote_port;
-    char  comm[16];
 };
 
 struct {
@@ -91,7 +90,7 @@ int tap_egress(struct __sk_buff *skb)
     __u32 slot = *idx % 64;
     struct capture_t cap = {};
     cap.remote_ip   = skb->remote_ip4;
-    cap.remote_port = (__u16)(__builtin_bswap32(skb->remote_port) >> 16);
+    cap.remote_port = (__u16)(skb->remote_port >> 16);
     bpf_map_update_elem(&cap_map, &slot, &cap, 0);
 
     __u32 nxt = *idx + 1;
@@ -125,7 +124,7 @@ cat > /tmp/tap_reader.c << 'EOF'
 static int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr, unsigned int size)
 { return (int)syscall(SYS_bpf, cmd, attr, size); }
 
-struct capture_t { uint32_t remote_ip; uint32_t remote_port; char comm[16]; };
+struct capture_t { uint32_t remote_ip; uint32_t remote_port; };
 
 int main(void) {
     union bpf_attr obj = {};
@@ -146,10 +145,10 @@ int main(void) {
             total = v < 64 ? v : 64;
     }
 
-    printf("\n\033[1;36m  %-5s %-20s %-8s %-16s\033[0m\n",
-           "Slot","Destination IP","Port","Process");
-    printf("  \033[2m%-5s %-20s %-8s %-16s\033[0m\n",
-           "----","---------------","----","-------");
+    printf("\n\033[1;36m  %-5s %-20s %-8s\033[0m\n",
+           "Slot","Destination IP","Port");
+    printf("  \033[2m%-5s %-20s %-8s\033[0m\n",
+           "----","---------------","----");
 
     int hits = 0;
     for (uint32_t i = 0; i < total; i++) {
@@ -163,8 +162,8 @@ int main(void) {
         struct in_addr a = { .s_addr = cap.remote_ip };
         char ipbuf[32];
         inet_ntop(AF_INET, &a, ipbuf, sizeof(ipbuf));
-        printf("  \033[1;33m%-5u\033[0m %-20s \033[1;32m%-8u\033[0m \033[1;35m%-16s\033[0m\n",
-               i, ipbuf, cap.remote_port, cap.comm);
+        printf("  \033[1;33m%-5u\033[0m %-20s \033[1;32m%-8u\033[0m\n",
+               i, ipbuf, cap.remote_port);
         hits++;
     }
     if (!hits)
