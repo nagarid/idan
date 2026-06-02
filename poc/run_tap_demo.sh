@@ -105,7 +105,7 @@ EOF
 atk "Compiling tap.bpf.c → tap.bpf.o  ($CLANG -target bpf)"
 # -I/usr/include/x86_64-linux-gnu needed so clang finds asm/types.h when
 # cross-compiling to BPF target on amd64 Ubuntu
-$CLANG -O2 -target bpf \
+$CLANG -O2 -g -target bpf \
     -I/usr/include/x86_64-linux-gnu \
     -c /tmp/tap.bpf.c -o /tmp/tap.bpf.o \
     || { echo -e "${RED}[ERROR] BPF compilation failed — aborting${NC}"; exit 1; }
