@@ -31,10 +31,25 @@ echo -e "${NC}"
 inf "Kernel: $(uname -r)    Host: $(hostname)"
 sep
 
-# ── Phase 0: toolchain ──────────────────────────────────────────────────────
+# ── Phase 0: toolchain + bpffs ─────────────────────────────────────────────
 inf "Installing BPF toolchain (clang + libbpf-dev)..."
-sudo apt-get install -y clang libbpf-dev > /dev/null 2>&1
-ok "Toolchain ready"
+sudo apt-get install -y clang libbpf-dev 2>&1 | grep -E "^(Reading|Unpacking|Setting|Selecting|E:|clang)" || true
+
+# clang may be versioned (clang-14, clang-15...) — find whichever is present
+CLANG=$(command -v clang 2>/dev/null \
+    || ls /usr/bin/clang-[0-9]* 2>/dev/null | sort -V | tail -1)
+if [ -z "$CLANG" ]; then
+    echo -e "${RED}[ERROR] clang not found. Try: sudo apt-get install -y clang${NC}" >&2
+    exit 1
+fi
+ok "clang: $CLANG  ($(${CLANG} --version | head -1))"
+
+inf "Checking /sys/fs/bpf (bpffs required for object pinning)..."
+if ! mountpoint -q /sys/fs/bpf 2>/dev/null; then
+    inf "/sys/fs/bpf not mounted — mounting bpffs now..."
+    sudo mount -t bpf bpf /sys/fs/bpf/
+fi
+ok "/sys/fs/bpf is mounted"
 sep
 
 # ── Phase 1: write tap.bpf.c ───────────────────────────────────────────────
@@ -87,8 +102,8 @@ int tap_egress(struct __sk_buff *skb)
 
 char LICENSE[] SEC("license") = "GPL";
 EOF
-atk "Compiling tap.bpf.c → tap.bpf.o  (clang -target bpf)"
-clang -O2 -target bpf -c /tmp/tap.bpf.c -o /tmp/tap.bpf.o
+atk "Compiling tap.bpf.c → tap.bpf.o  ($CLANG -target bpf)"
+$CLANG -O2 -target bpf -c /tmp/tap.bpf.c -o /tmp/tap.bpf.o
 ok "tap.bpf.o compiled — BPF bytecode ready"
 
 # ── Phase 2: write tap_reader.c ────────────────────────────────────────────
