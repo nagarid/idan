@@ -40,23 +40,36 @@ ALLOWED_IP="${3:?}"
 section "Phase 0: Install prerequisites"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq 2>/dev/null
-apt-get install -y -qq linux-tools-common python3 curl iproute2 \
+apt-get install -y -qq python3 curl iproute2 \
     2>&1 | grep -E "^(Unpacking|Setting up|E:)" || true
 
-# bpftool location varies across Ubuntu versions
-BPFTOOL=$(command -v bpftool 2>/dev/null || \
-          ls /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1 || \
-          true)
-if [ -z "$BPFTOOL" ]; then
-    # Try installing the versioned package matching the running kernel
-    KVER=$(uname -r)
-    apt-get install -y -qq "linux-tools-${KVER}" 2>/dev/null || \
-        apt-get install -y -qq linux-tools-generic 2>/dev/null || true
-    BPFTOOL=$(command -v bpftool 2>/dev/null || \
-              ls /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1 || true)
+# bpftool resolution order:
+#   1. Cilium ships a static bpftool at /usr/local/bin/bpftool — always use it
+#      if present (matches the kernel Cilium was compiled against, works in VM)
+#   2. Real binary under /usr/lib/linux-tools/<kernel-version>/bpftool
+#   3. PATH (may be the Ubuntu wrapper script — functional only when the
+#      matching linux-tools-<version> package is installed, which it won't
+#      be on a minikube VM kernel)
+BPFTOOL=$(  ls /usr/local/bin/bpftool 2>/dev/null \
+         || ls /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1 \
+         || command -v bpftool 2>/dev/null \
+         || true)
+
+# Verify the resolved bpftool actually works (wrapper silently fails on
+# minikube because linux-tools-<vm-kernel> is not packaged)
+if [ -n "$BPFTOOL" ]; then
+    $BPFTOOL version >/dev/null 2>&1 || BPFTOOL=""
 fi
-[ -z "$BPFTOOL" ] && { fail "bpftool not found — cannot proceed"; exit 1; }
-ok "bpftool: $BPFTOOL"
+
+if [ -z "$BPFTOOL" ]; then
+    fail "bpftool not found or not functional."
+    fail "Copy Cilium's static binary from the cilium-agent pod first (on the HOST):"
+    fail "  CPOD=\$(kubectl get pods -n kube-system -l k8s-app=cilium -o jsonpath='{.items[0].metadata.name}')"
+    fail "  kubectl cp kube-system/\${CPOD}:/usr/local/bin/bpftool /tmp/bpftool-cilium"
+    fail "  kubectl cp /tmp/bpftool-cilium cilium-research/attack-pod:/usr/local/bin/bpftool"
+    exit 1
+fi
+ok "bpftool: $BPFTOOL  ($(${BPFTOOL} version 2>&1 | head -1))"
 ok "python3: $(python3 --version 2>&1)"
 
 # Store bpftool path for Python sub-scripts
@@ -66,16 +79,25 @@ echo "$TARGET_IP $BLOCKED_IP $ALLOWED_IP" > /tmp/_research_ips
 # ── Phase 1: Discovery ────────────────────────────────────────────────────────
 section "Phase 1: Discover Cilium BPF state"
 
-inf "All BPF maps on this node:"
-$BPFTOOL map show 2>/dev/null | grep -E "^[0-9]|cilium" | head -40 || true
+inf "All BPF maps on this node (first 60 lines):"
+$BPFTOOL map show 2>&1 | head -60 || true
 echo ""
 
-# Locate cilium_ipcache — prefer pinned path, fall back to map list scan
+inf "bpffs contents:"
+find /sys/fs/bpf -maxdepth 3 2>/dev/null | head -40 || true
+echo ""
+
+# Locate cilium_ipcache — check all known Cilium pin paths
 IPCACHE_PATH=""
 for p in /sys/fs/bpf/tc/globals/cilium_ipcache \
-          /sys/fs/bpf/cilium/maps/cilium_ipcache; do
+          /sys/fs/bpf/cilium/maps/cilium_ipcache \
+          /sys/fs/bpf/cilium_globals/cilium_ipcache; do
     [ -e "$p" ] && { IPCACHE_PATH="$p"; break; }
 done
+# Also try a glob search under bpffs
+if [ -z "$IPCACHE_PATH" ]; then
+    IPCACHE_PATH=$(find /sys/fs/bpf -name "cilium_ipcache" 2>/dev/null | head -1 || true)
+fi
 
 if [ -n "$IPCACHE_PATH" ]; then
     IPCACHE_ID=$($BPFTOOL map show pinned "$IPCACHE_PATH" -j 2>/dev/null \
