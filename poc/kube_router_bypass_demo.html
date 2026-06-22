@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>kube-router NetworkPolicy Bypass — CAP_NET_RAW PoC</title>
+<link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.0/dist/bundle/asciinema-player.css" />
+<style>
+  body { background:#0d1117; color:#e6edf3; font-family:'Segoe UI',system-ui,sans-serif; margin:0; padding:2rem; }
+  h1 { color:#f78166; font-size:1.4rem; margin-bottom:0.25rem; }
+  .meta { color:#8b949e; font-size:0.85rem; margin-bottom:1.5rem; }
+  .badge { display:inline-block; background:#b91c1c; color:#fff; border-radius:4px; padding:2px 8px; font-size:0.75rem; font-weight:700; margin-right:6px; }
+  .badge.green { background:#15803d; }
+  .badge.yellow { background:#92400e; }
+  #player { max-width:1000px; margin:0 auto 2rem; border-radius:8px; overflow:hidden; box-shadow:0 8px 32px rgba(0,0,0,0.5); }
+  .summary { max-width:1000px; margin:0 auto; background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1.5rem; }
+  .summary h2 { color:#79c0ff; font-size:1rem; margin-top:0; }
+  pre { background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:1rem; overflow-x:auto; font-size:0.82rem; line-height:1.5; }
+  .highlight { color:#f78166; font-weight:700; }
+  table { border-collapse:collapse; width:100%; font-size:0.85rem; }
+  td,th { border:1px solid #30363d; padding:0.4rem 0.75rem; text-align:left; }
+  th { background:#21262d; color:#8b949e; }
+</style>
+</head>
+<body>
+<h1>kube-router / k3s NetworkPolicy Bypass</h1>
+<div class="meta">
+  <span class="badge">CVE-CANDIDATE</span>
+  <span class="badge yellow">CAP_NET_RAW</span>
+  <span class="badge green">NO PRIVILEGED</span>
+  Source IP Spoofing via Raw Sockets — kube-router KUBE-NWPLCY chain has no interface-based anti-spoofing
+</div>
+
+<div id="player"></div>
+
+<div class="summary">
+  <h2>What you're watching</h2>
+  <p>A pod with only <strong>CAP_NET_RAW</strong> (the <em>default</em> Kubernetes capability — no <code>privileged:true</code>) bypasses a <code>NetworkPolicy</code> enforced by <strong>kube-router</strong>.</p>
+
+  <table>
+    <tr><th>Step</th><th>Result</th></tr>
+    <tr><td>allowed-source (10.244.0.10) → target</td><td style="color:#3fb950">✓ DELIVERED (baseline)</td></tr>
+    <tr><td>blocked-source (10.244.0.20) → target, normal socket</td><td style="color:#3fb950">✓ BLOCKED (policy works)</td></tr>
+    <tr><td>blocked-source → target, <strong>raw socket spoofing src=10.244.0.10</strong></td><td style="color:#f78166">✗ BYPASSED — target received BYPASSED-KUBE-ROUTER</td></tr>
+  </table>
+
+  <h2>Root Cause</h2>
+  <pre>KUBE-NWPLCY-test:
+  -m set --match-set KUBE-SRC-&lt;hash&gt; src   ← <span class="highlight">source IP only, no -i &lt;interface&gt; check</span>
+  -d &lt;target&gt; -j MARK --set-xmark 0x10000
+
+# Calico (protected):
+cali-from-ep-*:
+  -i cali&lt;hash&gt; ! -s &lt;pod_ip&gt; -j DROP      ← <span class="highlight">interface AND IP — spoofing blocked</span></pre>
+
+  <h2>iptables Counters (end of run)</h2>
+  <pre>Chain KUBE-NWPLCY-test:
+  <span class="highlight">2 pkts MARK</span>  src=10.244.0.10 → 10.244.0.30   ← 1 legit + 1 spoofed
+
+Chain KUBE-POD-FW-test:
+  <span class="highlight">2 ACCEPT</span>  mark match 0x10000/0x10000        ← both packets accepted
+  1 DROP                                       ← real blocked-source dropped</pre>
+
+  <h2>Fix</h2>
+  <pre>iptables -I KUBE-ROUTER-FORWARD 1 -i &lt;pod_veth&gt; ! -s &lt;pod_ip&gt; -j DROP</pre>
+  <p>Or apply <code>restricted</code> PodSecurity Standard to drop CAP_NET_RAW cluster-wide.</p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.7.0/dist/bundle/asciinema-player.min.js"></script>
+<script>
+AsciinemaPlayer.create('kube_router_bypass.cast', document.getElementById('player'), {
+  cols: 120,
+  rows: 40,
+  autoPlay: true,
+  loop: true,
+  speed: 1.5,
+  theme: 'monokai',
+  fit: 'width'
+});
+</script>
+</body>
+</html>
