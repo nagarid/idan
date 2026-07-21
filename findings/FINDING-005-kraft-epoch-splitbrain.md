@@ -21,6 +21,8 @@
 
 In `KafkaRaftClient.handleVoteRequest()`, the epoch illegality check uses **different comparison operators** for PreVote (`>`) versus standard Vote (`>=`). At the boundary `lastEpoch == replicaEpoch`, a PreVote request passes while the corresponding Vote request is rejected. Under adversarial network conditions, this asymmetry allows two nodes to simultaneously accumulate PreVote majorities and proceed to election — potentially resulting in dual leaders and split-brain writes.
 
+> **Chained Exploitation:** see [CHAIN-B](../chains/CHAIN-B-epoch-splitbrain-to-hwm-toctou.md) — this finding can be used to manufacture, on demand, the exact demotion-in-flight race that FINDING-002's HWM TOCTOU otherwise has to wait for naturally. Chained, attack complexity drops from High to Low and the combined CVSS rises from 7.4 to 9.1.
+
 ## Vulnerable Code (verbatim)
 
 ```java

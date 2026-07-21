@@ -20,6 +20,8 @@
 
 `PluginUtils.pluginLocations()` and `pluginUrls()` resolve plugin paths without checking if symlink targets escape the declared plugin directory. Combined with `Plugins.java`'s `URLClassLoader` (no JAR signature verification), any JAR reachable via a symlink from the plugin directory is loaded and executed during connector instantiation. Static initializers in the loaded class run immediately at `loadClass()` time with full worker process privileges.
 
+> **Chained Exploitation:** standalone, this finding requires the attacker to already have filesystem write access to (or via symlink from) `plugin.path` — see [CHAIN-A](../chains/CHAIN-A-connect-rest-to-rce.md). Combined with FINDING-004's unauthenticated Connect REST API, an attacker with **zero** prerequisites can manufacture that write access using a built-in `FileStreamSinkConnector`, then trigger this finding's classloading RCE — full unauthenticated RCE, no filesystem foothold required.
+
 ## Vulnerable Code (verbatim)
 
 ```java

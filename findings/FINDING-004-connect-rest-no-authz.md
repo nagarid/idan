@@ -21,6 +21,8 @@
 
 The Connect REST API resource class `ConnectorsResource` exposes 20 JAX-RS endpoints (create, delete, update config, pause, resume, stop, alter offsets, reset offsets, restart, etc.) with **zero per-endpoint authorization annotations** (`@RolesAllowed`, `@DenyAll`, `@Secured`). There is no authentication filter registered at the REST server layer. Any client that can reach the Connect worker on port 8083 can invoke every endpoint without any credential.
 
+> **Chained Exploitation:** this finding alone is already CRITICAL, but it also supplies the missing precondition for FINDING-003 (Connect plugin symlink RCE) — see [CHAIN-A](../chains/CHAIN-A-connect-rest-to-rce.md). Built-in connectors reachable through this unauthenticated API can write attacker-controlled bytes to the filesystem, planting the payload FINDING-003 needs without the attacker ever needing a prior write primitive.
+
 ## Vulnerable Code (verbatim)
 
 ```java

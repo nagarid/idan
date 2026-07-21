@@ -1,5 +1,7 @@
 # FINDING-010: DistributedHerder Non-Cryptographic Leader Verification → Cluster Takeover
 
+> **REJECTED — moved out of the confirmed findings set.** See [`rejected/README.md`](README.md) for rationale: this finding assumes the attacker already holds WRITE ACL on the internal `__connect-configs` topic, a privileged grant that no other finding in this research provides a path to obtain. It assumes the compromise it claims to enable. Retained here for the audit trail, not counted in the confirmed-findings total.
+
 ## Metadata
 
 | Field | Value |

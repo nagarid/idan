@@ -8,11 +8,10 @@ All findings are novel — discovered through direct code reading, not derived f
 
 ## Executive Summary
 
-A source code audit of Apache Kafka trunk and the AWS MSK IAM authentication library identified **10 original vulnerability findings** spanning Remote Code Execution, RBAC/ACL bypass, authentication replay, data integrity violations, and denial of service. Several findings chain together for amplified impact in MSK Connect deployments.
+A source code audit of Apache Kafka trunk and the AWS MSK IAM authentication library identified **8 confirmed vulnerability findings** spanning Remote Code Execution, RBAC/ACL bypass, data integrity violations, and denial of service. Two additional candidate findings were reviewed and rejected (see `rejected/`) because each assumed a privileged starting point that nothing in this research demonstrates how to obtain. Two of the confirmed findings chain together for materially higher severity than either scores alone — see [Attack Chains](#attack-chains).
 
 | ID | Title | Category | CVSS v3.1 | MSK Impact |
 |----|-------|----------|-----------|------------|
-| [FINDING-001](#finding-001) | MSK IAM Token — Missing Server-Side Expiry | Auth Bypass | **7.4 HIGH** | All MSK IAM clusters |
 | [FINDING-002](#finding-002) | KRaft HWM TOCTOU — False Durability | Data Integrity | **7.4 HIGH** | MSK Standard (KRaft) |
 | [FINDING-003](#finding-003) | Connect Plugin Symlink → RCE | RCE | **8.8 HIGH** | MSK Connect |
 | [FINDING-004](#finding-004) | Connect REST API — No Authorization | RBAC Bypass | **9.8 CRITICAL** | MSK Connect |
@@ -21,18 +20,24 @@ A source code audit of Apache Kafka trunk and the AWS MSK IAM authentication lib
 | [FINDING-007](#finding-007) | ProduceRequest Int Overflow → Quota Bypass | Privilege Escalation | **7.1 HIGH** | All MSK clusters |
 | [FINDING-008](#finding-008) | RequestChannel NULL Deref → Broker Crash | Remote DoS | **7.5 HIGH** | All MSK clusters |
 | [FINDING-009](#finding-009) | MSK IAM — No Auth Rate Limiting → DoS Amp | Denial of Service | **7.5 HIGH** | All MSK IAM clusters |
-| [FINDING-010](#finding-010) | DistributedHerder Non-Crypto Leader → Takeover | RBAC Bypass | **8.8 HIGH** | MSK Connect |
+
+| Chain ID | Findings Combined | Combined CVSS v3.1 |
+|----------|--------------------|-----------------|
+| [CHAIN-A](chains/CHAIN-A-connect-rest-to-rce.md) | FINDING-004 → FINDING-003 | **9.8 CRITICAL** |
+| [CHAIN-B](chains/CHAIN-B-epoch-splitbrain-to-hwm-toctou.md) | FINDING-005 → FINDING-002 | **9.1 CRITICAL** |
+
+**Rejected:** FINDING-001 (IAM token replay), FINDING-010 (DistributedHerder leader forgery) — moved to `rejected/`, see rationale there.
 
 ---
 
 ## Severity Matrix
 
 ```
-CRITICAL (9.0+)  ████████████████████  FINDING-004 (9.8)
-HIGH     (7.0+)  ██████████████████    FINDING-003 (8.8), FINDING-010 (8.8)
+CRITICAL (9.0+)  ████████████████████  FINDING-004 (9.8), CHAIN-A (9.8), CHAIN-B (9.1)
+HIGH     (7.0+)  ██████████████████    FINDING-003 (8.8)
                  ████████████████      FINDING-006 (8.1)
                  █████████████         FINDING-008 (7.5), FINDING-009 (7.5)
-                 ████████████          FINDING-001 (7.4), FINDING-002 (7.4), FINDING-005 (7.4)
+                 ████████████          FINDING-002 (7.4), FINDING-005 (7.4)
                  ███████████           FINDING-007 (7.1)
 ```
 
@@ -46,7 +51,6 @@ HIGH     (7.0+)  ██████████████████    FINDI
 ├── METHODOLOGY.md                     ← Audit approach and rating methodology
 ├── REFERENCES.md                      ← Source files, NVD links, MITRE ATT&CK mapping
 ├── findings/
-│   ├── FINDING-001-msk-iam-token-replay.md
 │   ├── FINDING-002-kraft-hwm-toctou.md
 │   ├── FINDING-003-connect-plugin-path-rce.md
 │   ├── FINDING-004-connect-rest-no-authz.md
@@ -54,10 +58,17 @@ HIGH     (7.0+)  ██████████████████    FINDI
 │   ├── FINDING-006-acl-wildcard-deny-bypass.md
 │   ├── FINDING-007-produce-int-overflow-quota.md
 │   ├── FINDING-008-requestchannel-null-deref.md
-│   ├── FINDING-009-msk-iam-no-ratelimit.md
-│   └── FINDING-010-connect-herder-leader.md
+│   └── FINDING-009-msk-iam-no-ratelimit.md
+├── chains/                            ← Multi-finding attack chains (full reports)
+│   ├── CHAIN-A-connect-rest-to-rce.md
+│   └── CHAIN-B-epoch-splitbrain-to-hwm-toctou.md
+├── rejected/                          ← Findings removed from the confirmed set, with rationale
+│   ├── README.md
+│   ├── FINDING-001-msk-iam-token-replay.md
+│   ├── FINDING-010-connect-herder-leader.md
+│   ├── code-excerpts/
+│   └── payloads/
 ├── code-excerpts/                     ← Verbatim vulnerable code from source
-│   ├── IAMOAuthBearerToken-lifetimeMs.java
 │   ├── KafkaRaftClient-hwm-toctou.java
 │   ├── PluginUtils-symlink-traversal.java
 │   ├── Plugins-unsafe-classloader.java
@@ -66,10 +77,8 @@ HIGH     (7.0+)  ██████████████████    FINDI
 │   ├── StandardAuthorizerData-wildcard.java
 │   ├── ProduceRequest-size-overflow.java
 │   ├── RequestChannel-null-deref.scala
-│   ├── IAMCallbackHandler-no-ratelimit.java
-│   └── DistributedHerder-leader-check.java
+│   └── IAMCallbackHandler-no-ratelimit.java
 ├── payloads/                          ← PoC code (for authorized lab use only)
-│   ├── finding-001-replay-token.sh
 │   ├── finding-003-malicious-plugin.java
 │   ├── finding-003-symlink-setup.sh
 │   ├── finding-004-connect-rest-exploit.sh
@@ -77,6 +86,9 @@ HIGH     (7.0+)  ██████████████████    FINDI
 │   ├── finding-006-acl-deny-bypass.sh
 │   ├── finding-007-produce-overflow.py
 │   └── finding-008-null-deref-request.py
+├── lab/                                ← Live Kafka 4.2.0 (KRaft) Docker lab + FINDING-007 live PoC
+│   ├── docker-compose.yml
+│   └── poc_007_live.py
 └── deploy-yamls/                      ← Lab infrastructure configs
     ├── msk-connect-vulnerable-worker.yaml
     ├── kafka-connect-distributed.properties
@@ -86,12 +98,6 @@ HIGH     (7.0+)  ██████████████████    FINDI
 ---
 
 ## Finding Summaries
-
-### FINDING-001
-**MSK IAM Token — Missing Server-Side Expiry Validation**
-- Source: `aws/aws-msk-iam-auth` — `IAMOAuthBearerToken.java:44-74`
-- The `lifetimeMs` calculated from SigV4 `X-Amz-Expires` is never validated server-side. Captured tokens can be replayed past their 15-minute TTL.
-- [Full analysis →](findings/FINDING-001-msk-iam-token-replay.md)
 
 ### FINDING-002
 **KRaft High Watermark TOCTOU — False Durability Guarantee**
@@ -141,31 +147,21 @@ HIGH     (7.0+)  ██████████████████    FINDI
 - No rate limiter, credential cache, or circuit breaker on `resolveCredentials()`. A connection flood amplifies into IMDS/STS rate-limit exhaustion — blocking all client authentication.
 - [Full analysis →](findings/FINDING-009-msk-iam-no-ratelimit.md)
 
-### FINDING-010
-**DistributedHerder Non-Cryptographic Leader Verification → Cluster Takeover**
-- Source: `apache/kafka` — `DistributedHerder.java:1721`
-- `isLeader()` uses string equality on member IDs read from unverified Kafka topic records. A forged assignment record grants attacker-controlled workers cluster-wide leadership authority.
-- [Full analysis →](findings/FINDING-010-connect-herder-leader.md)
-
 ---
 
 ## Attack Chains
 
-### Chain A — MSK Connect Full Compromise (FINDING-004 → FINDING-003)
-1. Reach Connect REST API on port 8083 (no auth — FINDING-004)
-2. Create a connector pointing to an attacker-controlled class name
-3. If plugin directory contains a matching symlink (FINDING-003), classloading triggers a reverse shell
-4. Code executes as the MSK Connect execution IAM role
+Two confirmed findings compose into materially higher-severity chains than either scores alone. Full reports (metadata, combined CVSS derivation, step-by-step exploitation, detection) live in `chains/`.
 
-### Chain B — IAM Token Exfiltration + Replay (FINDING-004 → FINDING-001)
-1. Via unauth REST API (FINDING-004), create a FileStreamSink connector that writes all messages from sensitive topics to `/tmp/`
-2. Read those messages to find application-level AWS tokens or MSK IAM tokens in transit
-3. Replay captured MSK IAM token past TTL (FINDING-001) to maintain persistent broker access
+### CHAIN-A — Unauthenticated Connect REST Access → RCE (FINDING-004 → FINDING-003)
+FINDING-003's RCE standalone requires the attacker to already have filesystem write access to `plugin.path`. FINDING-004's unauthenticated REST API supplies that access for free via a built-in `FileStreamSinkConnector`, then triggers the classloading RCE — full unauthenticated RCE with zero prerequisites.
+**Combined CVSS: 9.8 CRITICAL** (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`)
+[Full report →](chains/CHAIN-A-connect-rest-to-rce.md)
 
-### Chain C — Connect Leader Takeover + Pipeline Destruction (FINDING-010 → FINDING-004)
-1. Write forged assignment to `__connect-configs` (FINDING-010)
-2. Attacker worker becomes "leader"
-3. Via now-authorized leader operations + unauth REST (FINDING-004): delete all production connectors
+### CHAIN-B — Epoch Asymmetry → HWM TOCTOU (FINDING-005 → FINDING-002)
+FINDING-002's false-durability TOCTOU only fires during a naturally-occurring demotion race (`AC:H`). FINDING-005's PreVote/Vote epoch asymmetry lets an attacker manufacture that exact race on demand, dropping attack complexity to Low.
+**Combined CVSS: 9.1 CRITICAL** (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H`) — up from 7.4 HIGH for either finding alone.
+[Full report →](chains/CHAIN-B-epoch-splitbrain-to-hwm-toctou.md)
 
 ---
 

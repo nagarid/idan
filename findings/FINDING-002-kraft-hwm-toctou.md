@@ -21,6 +21,8 @@
 
 In `KafkaRaftClient.onUpdateLeaderHighWatermark()`, append futures (pending `acks=all` produce requests) are completed — ACKing producers — **before** any re-validation that the node still holds quorum leadership. A demoted leader that has not yet processed its own demotion will confirm writes that exist only on its local log. When the new leader takes over, those records are truncated, causing silent data loss with valid producer acknowledgments.
 
+> **Chained Exploitation:** standalone, this finding is `AC:H` because the attacker can only wait for a demotion-in-flight race to occur naturally. See [CHAIN-B](../chains/CHAIN-B-epoch-splitbrain-to-hwm-toctou.md) — FINDING-005's epoch asymmetry can be used to manufacture that exact race condition on demand, dropping attack complexity to Low and raising the combined CVSS from 7.4 to 9.1.
+
 ## Vulnerable Code (verbatim)
 
 ```java

@@ -1,5 +1,7 @@
 # FINDING-001: MSK IAM Token — Missing Server-Side Expiry Validation
 
+> **REJECTED — moved out of the confirmed findings set.** See [`rejected/README.md`](README.md) for rationale: this finding assumes a captured/leaked token as its starting point, and nothing elsewhere in this research demonstrates how an attacker obtains one. It is not a self-contained finding. Retained here for the audit trail, not counted in the confirmed-findings total.
+
 ## Metadata
 
 | Field | Value |
